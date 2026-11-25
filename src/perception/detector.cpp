@@ -241,7 +241,8 @@ void ArmorDetector::extract_lightbars_pca(const FrameSlot& frame,
                 uy = -uy;
             }
 
-            // 第 3 遍：沿主轴投影求取高亮像素的精确亚像素上下端点
+            // 第 3 遍：沿主轴做 1D 亮度剖面梯度边缘 + 抛物线亚像素端点精修
+            // 先求高亮像素粗略投影范围，再在其外扩区间上定位物理上升/下降沿梯度峰值
             double min_proj = 1e9;
             double max_proj = -1e9;
             for (uint32_t y = fy0; y <= fy1; ++y) {
@@ -252,6 +253,88 @@ void ArmorDetector::extract_lightbars_pca(const FrameSlot& frame,
                         (static_cast<double>(x) - cx) * ux + (static_cast<double>(y) - cy) * uy;
                     min_proj = std::min(min_proj, proj);
                     max_proj = std::max(max_proj, proj);
+                }
+            }
+
+            // 沿主轴以 0.5px 步长采样 1D 亮度剖面：
+            // 对 Bayer 原图取 2x2 单元均值（恒含 1R+2G+1B），从数学上彻底消除奇偶行棋盘纹干扰
+            if (max_proj - min_proj >= 4.0) {
+                auto sample_bayer_cell_avg = [&](double px, double py) -> double {
+                    if (px < 0.5 || py < 0.5 ||
+                        px >= static_cast<double>(frame.width - 2U) ||
+                        py >= static_cast<double>(frame.height - 2U)) {
+                        return 0.0;
+                    }
+                    auto bilin = [&](double x, double y) -> double {
+                        const uint32_t x0 = static_cast<uint32_t>(x);
+                        const uint32_t y0 = static_cast<uint32_t>(y);
+                        const double dx = x - static_cast<double>(x0);
+                        const double dy = y - static_cast<double>(y0);
+                        const uint8_t* r0 = frame.host_ptr + static_cast<size_t>(y0) * frame.stride;
+                        const uint8_t* r1 = r0 + frame.stride;
+                        const double top = r0[x0] + dx * (r0[x0 + 1U] - r0[x0]);
+                        const double bot = r1[x0] + dx * (r1[x0 + 1U] - r1[x0]);
+                        return top + dy * (bot - top);
+                    };
+                    return 0.25 * (bilin(px - 0.5, py - 0.5) + bilin(px + 0.5, py - 0.5) +
+                                   bilin(px - 0.5, py + 0.5) + bilin(px + 0.5, py + 0.5));
+                };
+
+                constexpr double kStep = 0.5;
+                const double s_start = min_proj - 3.0;
+                const double s_end = max_proj + 3.0;
+                const int n_samples = static_cast<int>(std::floor((s_end - s_start) / kStep)) + 1;
+                if (n_samples >= 10 && n_samples <= 512) {
+                    double profile[512];
+                    for (int k = 0; k < n_samples; ++k) {
+                        const double s = s_start + k * kStep;
+                        profile[k] = sample_bayer_cell_avg(cx + s * ux, cy + s * uy);
+                    }
+
+                    // 仅在粗略端点 ±3px 邻域内搜索物理上升/下降沿梯度峰值，避免内部反光干扰
+                    const int edge_band = std::min(n_samples / 2, static_cast<int>(6.0 / kStep));
+                    int best_top = -1;
+                    double max_g_top = 8.0;
+                    for (int k = 1; k < edge_band; ++k) {
+                        const double g = profile[k + 1] - profile[k - 1];
+                        if (g > max_g_top) {
+                            max_g_top = g;
+                            best_top = k;
+                        }
+                    }
+
+                    int best_bot = -1;
+                    double max_g_bot = 8.0;
+                    for (int k = n_samples - edge_band; k < n_samples - 1; ++k) {
+                        const double g = profile[k - 1] - profile[k + 1];
+                        if (g > max_g_bot) {
+                            max_g_bot = g;
+                            best_bot = k;
+                        }
+                    }
+
+                    // 抛物线三点亚像素插值精修梯度峰值位置
+                    auto refine_peak = [&](int idx, bool is_rising) -> double {
+                        double sub = 0.0;
+                        if (idx >= 2 && idx <= n_samples - 3) {
+                            const double g_m = is_rising ? (profile[idx] - profile[idx - 2])
+                                                         : (profile[idx - 2] - profile[idx]);
+                            const double g_0 = is_rising ? (profile[idx + 1] - profile[idx - 1])
+                                                         : (profile[idx - 1] - profile[idx + 1]);
+                            const double g_p = is_rising ? (profile[idx + 2] - profile[idx])
+                                                         : (profile[idx] - profile[idx + 2]);
+                            const double denom = g_m - 2.0 * g_0 + g_p;
+                            if (std::fabs(denom) > 1e-6) {
+                                sub = std::clamp(0.5 * (g_m - g_p) / denom, -0.5, 0.5);
+                            }
+                        }
+                        return s_start + (static_cast<double>(idx) + sub) * kStep;
+                    };
+
+                    if (best_top >= 0 && best_bot > best_top) {
+                        min_proj = refine_peak(best_top, true);
+                        max_proj = refine_peak(best_bot, false);
+                    }
                 }
             }
 

@@ -31,6 +31,14 @@ public:
                            const Eigen::Matrix3d& R_world2cam,
                            const Eigen::Vector3d& t_world2cam,
                            double armor_pitch_rad = 15.0 * 3.14159265358979323846 / 180.0) const;
+
+    /// 去畸变 + 4-DoF（x, y, z, yaw）阻尼 Gauss-Newton 联合位姿精修：
+    /// 先对四角点做镜头去畸变消除边缘畸变误差，再用 1D 黄金分割消除朝向翻转，
+    /// 最后在物理固定倾角（pitch=±15°, roll=0°）约束下联合优化 3D 位置与朝向。
+    void refine_pose_4dof(const Armor& armor, Eigen::Vector3d& pos_world, double& yaw_world,
+                          const Eigen::Matrix3d& R_world2cam,
+                          const Eigen::Vector3d& t_world2cam,
+                          double armor_pitch_rad = 15.0 * 3.14159265358979323846 / 180.0) const;
 #endif
 
 private:

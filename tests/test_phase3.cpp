@@ -117,7 +117,18 @@ void test_pnp_1d_yaw_optimization(const AppConfig& cfg) {
     const double err_deg = std::fabs(shortest_angular_distance(true_yaw, est_yaw)) * 180.0 / kPi;
     CHECK(err_deg < 0.5);
 
-    std::cout << std::fixed << std::setprecision(3) << "OK (err=" << err_deg << " deg)\n";
+    // 验证 4-DoF Gauss-Newton 联合精修：故意给初值注入 8cm 深度噪声与 15° 朝向偏置
+    Eigen::Vector3d noisy_pos = pos_w + Eigen::Vector3d(0.08, -0.02, 0.015);
+    double noisy_yaw = wrap_to_pi(true_yaw + 15.0 * kDegToRad);
+    solver.refine_pose_4dof(armor, noisy_pos, noisy_yaw, R_w2c, t_w2c, pitch_rad);
+    const double pos_err_mm = (noisy_pos - pos_w).norm() * 1000.0;
+    const double yaw_err_deg = std::fabs(shortest_angular_distance(true_yaw, noisy_yaw)) * 180.0 / kPi;
+    CHECK(pos_err_mm < 5.0);
+    CHECK(yaw_err_deg < 0.5);
+
+    std::cout << std::fixed << std::setprecision(3)
+              << "OK (1D_err=" << err_deg << " deg, 4DoF_pos_err=" << pos_err_mm
+              << " mm, 4DoF_yaw_err=" << yaw_err_deg << " deg)\n";
 #else
     (void)cfg;
     std::cout << "SKIPPED\n";
@@ -180,6 +191,17 @@ void test_ekf_pulse_spin_and_extensible_predictor(const AppConfig& cfg) {
     CHECK(std::fabs(est.vx - vx) < 0.25);
     CHECK(std::fabs(est.v_yaw - omega) < 0.8);
 
+    // 注入一帧 0.65m 极端遮挡野点，验证马氏门控拒收机制不会拉偏车体中心
+    {
+        WorldArmorObs outlier{};
+        outlier.pos_world = {est.xc + 0.65, est.yc - 0.30, est.zc};
+        outlier.yaw_world = est.yaw;
+        outlier.class_id = 3;
+        tracker.update(261ULL * 5'000'000ULL, {outlier});
+        const VehicleState after = tracker.vehicle_state();
+        CHECK(std::hypot(after.xc - est.xc, after.yc - est.yc) < 0.05);
+    }
+
     // 验证外挂 IMotionPredictor 接口可正常插拔
     struct CustomStubPredictor final : public IMotionPredictor {
         mutable int calls = 0;
@@ -206,16 +228,34 @@ void test_ballistic_and_aimer(const AppConfig& cfg) {
     std::cout << "[TEST] 空气阻力弹道解算 + Aimer 前馈与切板保护... ";
 
     BallisticSolver solver(0.019, 9.7933);
-    // 水平距离 5.0m，目标与枪口等高 (z=0)，弹速 24m/s，需抬头补偿重力下坠（pitch > 0）
+    // 1) 水平距离 5.0m，目标与枪口等高 (z=0)，弹速 24m/s，需抬头补偿重力下坠（pitch > 0）
     const BallisticSolution sol = solver.solve(5.0, 0.0, 0.0, 24.0);
     CHECK(sol.valid);
-    CHECK(sol.pitch_rad > 0.02 && sol.pitch_rad < 0.12);  // 约 2.5°~3.5° 抬头补偿
+    CHECK(sol.pitch_rad > 0.02 && sol.pitch_rad < 0.12);
     CHECK(sol.fly_time_s > 0.20 && sol.fly_time_s < 0.25);
 
-    // 回代验证物理落点精度 (< 1 mm)
-    const double t = sol.fly_time_s;
-    const double z_hit = 24.0 * std::sin(sol.pitch_rad) * t - 0.5 * 9.7933 * t * t;
-    CHECK(std::fabs(z_hit - 0.0) < 0.001);
+    // 2) 大仰角打高地测试（水平 4.0m，高度 +2.0m），验证完整耦合 RK4 二次阻力求解收敛
+    const BallisticSolution high_sol = solver.solve(4.0, 0.0, 2.0, 24.0);
+    CHECK(high_sol.valid);
+    CHECK(high_sol.pitch_rad > std::atan2(2.0, 4.0));  // 仰角必须大于几何连线角
+
+    // 使用超细步长（0.1ms）欧拉/RK4 独立仿真校验 5m 与高地两个解的物理落点误差 (< 2 mm)
+    auto verify_hit = [&](double target_d, double target_z, double pitch_rad) {
+        double px = 0.0, pz = 0.0;
+        double vx = 24.0 * std::cos(pitch_rad);
+        double vz = 24.0 * std::sin(pitch_rad);
+        constexpr double dt = 0.0001;
+        while (px < target_d) {
+            const double sp = std::hypot(vx, vz);
+            vx += (-0.019 * sp * vx) * dt;
+            vz += (-9.7933 - 0.019 * sp * vz) * dt;
+            px += vx * dt;
+            pz += vz * dt;
+        }
+        CHECK(std::fabs(pz - target_z) < 0.002);
+    };
+    verify_hit(5.0, 0.0, sol.pitch_rad);
+    verify_hit(4.0, 2.0, high_sol.pitch_rad);
 
 #ifdef RM_AIM_WITH_EIGEN
     EkfTracker tracker(cfg.tracker, 0.20);

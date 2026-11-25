@@ -215,6 +215,21 @@ void EkfTracker::ekf_update_armor(int armor_id, const WorldArmorObs& obs) {
 
     MeasMat S = H * P_ * H.transpose() + R;
 
+    // 鲁棒位置野点门控（抗半遮挡/反光测距跳变）+ Huber 平滑降权
+    const Eigen::Vector3d y_pos = y.head<3>();
+    const Eigen::Matrix3d S_pos = S.topLeftCorner<3, 3>();
+    const double nis_pos = y_pos.transpose() * S_pos.ldlt().solve(y_pos);
+    if (state_ == TrackState::Tracking && nis_pos > 36.0) {
+        // 超过 ~6 sigma 的极端测距野点直接拒收，避免污染整车中心与速度估计
+        return;
+    }
+    if (nis_pos > 6.25) {
+        // 中度异常观测按 Huber 权重膨胀位置测量方差 R，平滑抑制单帧抖动
+        const double huber_scale = std::sqrt(nis_pos) / 2.5;
+        R.topLeftCorner<3, 3>() *= (huber_scale * huber_scale);
+        S = H * P_ * H.transpose() + R;
+    }
+
     // 新息自适应检测：计算角度残差归一化卡方值，检测脉冲转速突变
     const double nis_yaw = (y(3) * y(3)) / std::max(1e-6, S(3, 3));
     if (nis_yaw > 4.0) {

@@ -140,11 +140,11 @@ int main(int argc, char** argv) {
             if (pnp_solver.solve(a)) {
                 auto obs =
                     rm_aim::estimation::transform_armor_to_world(a, synced_imu, cfg.extrinsics);
-                // 结合重力方向与装甲板固定物理倾角（前哨站 -15°，其余 +15°）做 1D 黄金分割朝向消歧
+                // 去畸变 + 物理倾角约束下的 4-DoF 联合位姿精修（前哨站 -15°，其余 +15°）
                 constexpr double kDeg15 = 15.0 * 3.14159265358979323846 / 180.0;
                 const double armor_pitch = (a.class_id == 6) ? -kDeg15 : kDeg15;
-                obs.yaw_world = pnp_solver.optimize_yaw_1d(a, obs.pos_world, R_w2c, t_w2c,
-                                                           armor_pitch);
+                pnp_solver.refine_pose_4dof(a, obs.pos_world, obs.yaw_world, R_w2c, t_w2c,
+                                            armor_pitch);
                 world_obs.push_back(obs);
             }
         }
