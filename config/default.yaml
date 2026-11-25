@@ -1,0 +1,98 @@
+# RM Auto-Aim 精简配置文件
+# 标定内参/外参与火控参数继承自实车 RM2027-AutoAim，串口协议对齐 h7_framework
+
+target:
+  # 敌方颜色: "red" 或 "blue" (因 h7_framework 协议未下发敌方颜色，此处显式配置)
+  enemy_color: "blue"
+
+camera:
+  # 数据源类型: "hik" (海康MVS), "replay" (.rmraw 录包), "synthetic" (离线压测合成流)
+  source: "hik"
+  # 仅 source == "replay" 时生效
+  replay_path: ""
+  # 海康相机硬件参数 (强制 BayerRG8 + 关闭自动白平衡/自动曝光)
+  exposure_us: 2000.0
+  gain: 16.0
+  frame_rate: 200.0
+  # USB 断线自动复位用 VID:PID (海康默认 2bdf:0001)
+  vid_pid: "2bdf:0001"
+  # 软同步曝光中点时间补偿 (ms)
+  time_offset_ms: 0.0
+  # 实车标定内参 (重投影误差: 0.1322px)
+  camera_matrix: [1776.9477196851155, 0.0, 756.31235265560952, 0.0, 1776.0591253569607, 566.16539069551641, 0.0, 0.0, 1.0]
+  distort_coeffs: [-0.08382326954462313, 0.097449270330296239, -0.0012558283068959985, 0.0037372210254148081, 0.0]
+
+extrinsics:
+  # 云台到 IMU 机体系旋转矩阵
+  r_gimbal2imubody: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+  # 相机到云台旋转矩阵与平移向量 (m)
+  r_camera2gimbal: [0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0, 0.0]
+  t_camera2gimbal: [0.1, 0.0, 0.05]
+
+serial:
+  # 支持 UART (/dev/ttyTHS0, /dev/ttyUSB0) 与 USB-CDC (/dev/ttyACM0, /dev/serial/by-id/...)
+  # 设为 "loopback" 可启用纯内存虚拟回环测试
+  device: "/dev/ttyACM0"
+  # 断线重连备选前缀 (按顺序扫描)
+  fallback_prefix: "/dev/ttyACM"
+  baudrate: 921600
+  auto_reconnect: true
+  reconnect_interval_ms: 200
+
+detector:
+  # Bayer 域红蓝通道差阈值与亮度阈值
+  color_diff_thresh: 50
+  brightness_thresh: 140
+  # 灯条几何约束
+  max_angle_error_deg: 45.0
+  min_lightbar_ratio: 1.5
+  max_lightbar_ratio: 20.0
+  min_lightbar_length: 8.0
+  # 装甲板几何约束
+  min_armor_ratio: 1.0
+  max_armor_ratio: 5.0
+  max_side_ratio: 1.5
+  max_rectangular_error_deg: 25.0
+  # 超轻量 MLP 数字分类器
+  mlp_weights_path: "models/armor_mlp.bin"
+  min_confidence: 0.80
+  # 动态 ROI 追踪开关与外扩倍率
+  use_dynamic_roi: true
+  roi_scale: 2.5
+  full_scan_interval: 15
+
+tracker:
+  min_detect_count: 5
+  max_temp_lost_count: 15
+  outpost_max_temp_lost_count: 75
+
+aimer:
+  yaw_offset_deg: -2.5
+  pitch_offset_deg: 0.0
+  coming_angle_deg: 70.0
+  leaving_angle_deg: 30.0
+  decision_speed_rad_s: 7.0
+  high_speed_delay_s: 0.066
+  low_speed_delay_s: 0.015
+  first_tolerance_deg: 3.0
+  second_tolerance_deg: 2.0
+  judge_distance_m: 2.0
+  auto_fire: true
+  # 射频-弹道协同参数（发送给 h7_framework VisionToGimbal.fire_rate_hz）
+  max_fire_rate_hz: 20
+  min_fire_rate_hz: 6
+  bullet_speed_alpha: 0.3
+
+debug:
+  # SSH 终端原地刷新仪表盘
+  enable_tui: true
+  # 零依赖 MJPEG HTTP 推流 (仅浏览器连接时编码，无人看时 0 CPU)
+  enable_mjpeg: false
+  mjpeg_port: 8080
+  # PlotJuggler UDP JSON 遥测
+  enable_udp_telemetry: false
+  udp_host: "127.0.0.1"
+  udp_port: 9870
+  # 原始 Bayer + IMU 同步录包
+  enable_record: false
+  record_path: "records/capture.rmraw"

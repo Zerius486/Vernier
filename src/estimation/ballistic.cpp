@@ -1,0 +1,239 @@
+#include "rm_aim/estimation/ballistic.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <numbers>
+
+namespace rm_aim::estimation {
+
+namespace {
+
+constexpr double kDegToRad = std::numbers::pi_v<double> / 180.0;
+
+}  // namespace
+
+BallisticSolver::BallisticSolver(double air_drag_k, double gravity)
+    : k_(air_drag_k), g_(gravity) {}
+
+BallisticSolution BallisticSolver::solve(double x, double y, double z,
+                                         double bullet_speed) const noexcept {
+    BallisticSolution sol{};
+    const double d = std::hypot(x, y);
+    if (d < 0.05 || !std::isfinite(d) || !std::isfinite(z)) {
+        return sol;
+    }
+
+    // 保护弹速下限，避免串口初始帧弹速为 0 导致除零
+    const double v0 = (bullet_speed > 8.0 && bullet_speed < 40.0) ? bullet_speed : 24.0;
+    sol.yaw_rad = std::atan2(y, x);
+    sol.horizontal_dist = d;
+
+    // 竖直平面空气阻力模型：
+    //   x(t) = (1/k) * ln(k * v0 * cos(theta) * t + 1)  =>  t = (exp(k * d) - 1) / (k * v0 * cos(theta))
+    //   z(t) = v0 * sin(theta) * t - 0.5 * g * t^2
+    // 通过不动点迭代调整虚拟瞄准高度 z_aim，6 次迭代即可收敛到 < 0.005°
+    double z_aim = z;
+    double pitch = std::atan2(z_aim, d);
+    double t_fly = d / v0;
+
+    for (int iter = 0; iter < 8; ++iter) {
+        pitch = std::atan2(z_aim, d);
+        const double cos_p = std::max(0.1, std::cos(pitch));
+        const double vx = v0 * cos_p;
+        if (k_ > 1e-6) {
+            t_fly = (std::exp(k_ * d) - 1.0) / (k_ * vx);
+        } else {
+            t_fly = d / vx;
+        }
+        const double z_actual = v0 * std::sin(pitch) * t_fly - 0.5 * g_ * t_fly * t_fly;
+        const double err_z = z - z_actual;
+        z_aim += err_z;
+        if (std::fabs(err_z) < 1e-4) {
+            break;
+        }
+    }
+
+    sol.pitch_rad = std::atan2(z_aim, d);  // 抬头为正
+    sol.fly_time_s = t_fly;
+    sol.valid = std::isfinite(sol.pitch_rad) && std::isfinite(sol.fly_time_s);
+    return sol;
+}
+
+#ifdef RM_AIM_WITH_EIGEN
+
+Aimer::Aimer(AimerConfig cfg) : cfg_(std::move(cfg)) {}
+
+int Aimer::select_armor_id(const VehicleState& state, double center_yaw) const {
+    const auto armors = EkfTracker::compute_armors(state);
+    if (armors.empty()) return 0;
+
+    const double coming_rad = cfg_.coming_angle_deg * kDegToRad;
+    const double leaving_rad = cfg_.leaving_angle_deg * kDegToRad;
+
+    // 计算每块装甲板相对“正对云台方向（center_yaw + pi）”的偏角
+    const double ideal_armor_yaw = wrap_to_pi(center_yaw + std::numbers::pi_v<double>);
+
+    // 滞回策略：若上一帧选中的板仍未转出离开角，且转速不是极端情况，优先保持避免抖动切板
+    if (last_armor_id_ >= 0 && last_armor_id_ < static_cast<int>(armors.size())) {
+        const double rel = shortest_angular_distance(ideal_armor_yaw,
+                                                     armors[static_cast<size_t>(last_armor_id_)].yaw);
+        const bool moving_out = (state.v_yaw >= 0.0 && rel > leaving_rad) ||
+                                (state.v_yaw < 0.0 && rel < -leaving_rad);
+        if (!moving_out && std::fabs(rel) < coming_rad) {
+            return last_armor_id_;
+        }
+    }
+
+    // 否则选择最接近正对云台的装甲板（高速旋转时略微偏向即将转入的那块板）
+    int best_id = 0;
+    double best_score = 1e18;
+    const double spin_bias = (std::fabs(state.v_yaw) > 1.5)
+                                 ? ((state.v_yaw > 0.0) ? -0.15 : 0.15)
+                                 : 0.0;
+    for (const auto& a : armors) {
+        const double rel = shortest_angular_distance(ideal_armor_yaw, a.yaw);
+        const double score = std::fabs(rel - spin_bias);
+        if (score < best_score) {
+            best_score = score;
+            best_id = a.id;
+        }
+    }
+    return best_id;
+}
+
+BallisticSolution Aimer::solve_for_armor_at(const EkfTracker& tracker, int armor_id,
+                                            double dt, double bullet_speed) const {
+    const VehicleState s = tracker.predict_state(dt);
+    const auto armors = EkfTracker::compute_armors(s);
+    const auto& a = armors[static_cast<size_t>(armor_id % static_cast<int>(armors.size()))];
+    return ballistic_.solve(a.x, a.y, a.z, bullet_speed);
+}
+
+void Aimer::update_bullet_speed(const ImuSample& imu) noexcept {
+    // 仅在合理物理区间内更新实时弹速（既兼容摩擦轮转速映射弹速，也兼容裁判系统测速）
+    if (imu.bullet_speed > 10.0f && imu.bullet_speed < 35.0f) {
+        if (!has_bullet_count_) {
+            filtered_bullet_speed_ = static_cast<double>(imu.bullet_speed);
+            last_bullet_count_ = imu.bullet_count;
+            has_bullet_count_ = true;
+        } else if (imu.bullet_count != last_bullet_count_) {
+            // 检测到实际出弹递增时用更高权重刷新滤波弹速，及时跟随连发掉速
+            const double a = std::clamp(cfg_.bullet_speed_alpha, 0.05, 1.0);
+            filtered_bullet_speed_ =
+                (1.0 - a) * filtered_bullet_speed_ + a * static_cast<double>(imu.bullet_speed);
+            last_bullet_count_ = imu.bullet_count;
+        } else {
+            // 无新发弹计数时缓慢跟踪下位机实时摩擦轮映射弹速
+            filtered_bullet_speed_ =
+                0.95 * filtered_bullet_speed_ + 0.05 * static_cast<double>(imu.bullet_speed);
+        }
+    }
+}
+
+uint8_t Aimer::compute_adaptive_fire_rate(double dist_m, double yaw_err_rad,
+                                          double v_yaw) const noexcept {
+    const double max_hz = static_cast<double>(std::max(cfg_.min_fire_rate_hz, cfg_.max_fire_rate_hz));
+    const double min_hz = static_cast<double>(std::min(cfg_.min_fire_rate_hz, cfg_.max_fire_rate_hz));
+
+    // 距离因子：2m 内满频，2m~6m 线性降频以稳定摩擦轮转速与远距弹道
+    const double dist_factor = std::clamp(1.0 - (dist_m - 2.0) / 5.0, 0.25, 1.0);
+    // 转速因子：高速小陀螺时适度降频以减少切板空档浪费热量
+    const double spin_factor = std::clamp(1.0 - (std::fabs(v_yaw) - 3.0) / 12.0, 0.40, 1.0);
+    // 对准精度因子：越贴近中心射频越高
+    const double align_factor = std::clamp(1.0 - std::fabs(yaw_err_rad) / (3.0 * kDegToRad), 0.50, 1.0);
+
+    const double factor = dist_factor * spin_factor * align_factor;
+    const double hz = min_hz + factor * (max_hz - min_hz);
+    return static_cast<uint8_t>(std::clamp(std::lround(hz), static_cast<long>(min_hz), 40L));
+}
+
+GimbalCmd Aimer::compute_command(const EkfTracker& tracker, const ImuSample& current_imu) {
+    GimbalCmd cmd{};
+    last_switched_ = false;
+    update_bullet_speed(current_imu);
+
+    if (!tracker.is_tracking()) {
+        last_armor_id_ = -1;
+        return cmd;
+    }
+
+    const VehicleState cur = tracker.vehicle_state();
+    const double bullet_speed = filtered_bullet_speed_;
+    const double sys_delay = (std::fabs(cur.v_yaw) >= cfg_.decision_speed_rad_s)
+                                 ? cfg_.high_speed_delay_s
+                                 : cfg_.low_speed_delay_s;
+
+    // 第 1 步：用当前车体中心粗算飞行时间，预测未来车体状态并选定目标装甲板
+    const BallisticSolution center_sol = ballistic_.solve(cur.xc, cur.yc, cur.zc, bullet_speed);
+    if (!center_sol.valid) return cmd;
+
+    const double t_coarse = center_sol.fly_time_s + sys_delay;
+    const VehicleState pred_coarse = tracker.predict_state(t_coarse);
+    const double center_yaw = std::atan2(pred_coarse.yc, pred_coarse.xc);
+    const int chosen_id = select_armor_id(pred_coarse, center_yaw);
+
+    last_switched_ = (last_armor_id_ != -1) && (chosen_id != last_armor_id_);
+    last_armor_id_ = chosen_id;
+
+    // 第 2 步：对选定装甲板做 2 次飞行时间耦合迭代，得到精确打击时刻 t_hit
+    double t_hit = t_coarse;
+    BallisticSolution sol{};
+    for (int iter = 0; iter < 2; ++iter) {
+        sol = solve_for_armor_at(tracker, chosen_id, t_hit, bullet_speed);
+        if (!sol.valid) return cmd;
+        t_hit = sol.fly_time_s + sys_delay;
+    }
+
+    // 第 3 步：叠加机械零位偏置，并对下位机当前 yaw 做最短角展开（避免跨 ±pi 跳变）
+    const double target_yaw_world = sol.yaw_rad + cfg_.yaw_offset_deg * kDegToRad;
+    const double target_pitch_world = sol.pitch_rad + cfg_.pitch_offset_deg * kDegToRad;
+    const double yaw_err = shortest_angular_distance(current_imu.yaw, target_yaw_world);
+    const double pitch_err = target_pitch_world - static_cast<double>(current_imu.pitch);
+
+    cmd.yaw = static_cast<float>(static_cast<double>(current_imu.yaw) + yaw_err);
+    cmd.pitch = static_cast<float>(target_pitch_world);
+
+    // 第 4 步：在 t_hit 附近做 1ms 中心差分计算速度/加速度前馈；
+    // 切板瞬间将前馈置零，防止角度阶跃产生巨大加速度脉冲打抽云台
+    if (!last_switched_) {
+        constexpr double h = 0.002;  // 2 ms 中心差分步长
+        const BallisticSolution sol_m = solve_for_armor_at(tracker, chosen_id, t_hit - h, bullet_speed);
+        const BallisticSolution sol_p = solve_for_armor_at(tracker, chosen_id, t_hit + h, bullet_speed);
+        if (sol_m.valid && sol_p.valid) {
+            const double dy_p = shortest_angular_distance(sol.yaw_rad, sol_p.yaw_rad);
+            const double dy_m = shortest_angular_distance(sol_m.yaw_rad, sol.yaw_rad);
+            const double dp_p = sol_p.pitch_rad - sol.pitch_rad;
+            const double dp_m = sol.pitch_rad - sol_m.pitch_rad;
+
+            const double yaw_vel = (dy_p + dy_m) / (2.0 * h);
+            const double yaw_acc = (dy_p - dy_m) / (h * h);
+            const double pitch_vel = (dp_p + dp_m) / (2.0 * h);
+            const double pitch_acc = (dp_p - dp_m) / (h * h);
+
+            // 限幅保护，防止极端噪声放大
+            cmd.yaw_vel = static_cast<float>(std::clamp(yaw_vel, -12.0, 12.0));
+            cmd.yaw_acc = static_cast<float>(std::clamp(yaw_acc, -60.0, 60.0));
+            cmd.pitch_vel = static_cast<float>(std::clamp(pitch_vel, -8.0, 8.0));
+            cmd.pitch_acc = static_cast<float>(std::clamp(pitch_acc, -40.0, 40.0));
+        }
+    }
+
+    // 第 5 步：根据距离与角度容差决定是否开火及自适应建议射频（mode: 1=仅瞄准, 2=瞄准并开火）
+    const double tol_rad = ((sol.horizontal_dist < cfg_.judge_distance_m)
+                                ? cfg_.first_tolerance_deg
+                                : cfg_.second_tolerance_deg) *
+                           kDegToRad;
+    const bool in_window = (std::fabs(yaw_err) <= tol_rad) && (std::fabs(pitch_err) <= tol_rad);
+    if (cfg_.auto_fire && in_window) {
+        cmd.mode = 2U;
+        cmd.fire_rate_hz = compute_adaptive_fire_rate(sol.horizontal_dist, yaw_err, cur.v_yaw);
+    } else {
+        cmd.mode = 1U;
+        cmd.fire_rate_hz = 0U;
+    }
+    return cmd;
+}
+
+#endif  // RM_AIM_WITH_EIGEN
+
+}  // namespace rm_aim::estimation

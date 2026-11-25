@@ -1,0 +1,6 @@
+build/
+records/
+*.rmraw
+.cache/
+.vscode/
+compile_commands.json
