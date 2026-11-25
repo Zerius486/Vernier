@@ -5,6 +5,10 @@
 #include <cmath>
 #include <cstring>
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
+
 #ifdef RM_AIM_WITH_EIGEN
 #include <Eigen/Core>
 #endif
@@ -22,13 +26,74 @@ void run_bayer_thresh(const uint8_t* src, uint32_t stride, uint32_t roi_x, uint3
     // BayerBG8: e0=B, e1=G, o0=G, o1=R
     // BayerGR8: e0=G, e1=R, o0=B, o1=G
     // BayerGB8: e0=G, e1=B, o0=R, o1=G
+#if defined(__AVX2__)
+    const bool use_avx2 = (diff_thresh >= 0 && diff_thresh <= 255 &&
+                           bright_thresh >= 0 && bright_thresh <= 255);
+    const __m128i shuf_even = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14,
+                                            -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i shuf_odd = _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15,
+                                           -1, -1, -1, -1, -1, -1, -1, -1);
+    const __m128i v_bright = _mm_set1_epi8(static_cast<char>(bright_thresh));
+    const __m128i v_diff = _mm_set1_epi8(static_cast<char>(diff_thresh));
+    const __m128i v_zero = _mm_setzero_si128();
+    const __m128i v_all_ff = _mm_set1_epi8(-1);
+
+    // 从 32 字节（16 对 Bayer 像素）中快速抽取 16 字节偶索引或奇索引通道
+    auto extract_16 = [&](const uint8_t* ptr, bool odd_col) -> __m128i {
+        const __m256i v32 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(ptr));
+        const __m128i lo = _mm256_castsi256_si128(v32);
+        const __m128i hi = _mm256_extracti128_si256(v32, 1);
+        const __m128i& shuf = odd_col ? shuf_odd : shuf_even;
+        return _mm_unpacklo_epi64(_mm_shuffle_epi8(lo, shuf), _mm_shuffle_epi8(hi, shuf));
+    };
+#endif
+
     for (uint32_t hy = 0; hy < half_h; ++hy) {
         const uint8_t* even = src + static_cast<size_t>(roi_y + hy * 2U) * stride + roi_x;
         const uint8_t* odd = even + stride;
         uint8_t* out_row = dst_mask + static_cast<size_t>(hy) * half_w;
         uint8_t any_hit = 0;
+        uint32_t hx = 0;
 
-        for (uint32_t hx = 0; hx < half_w; ++hx) {
+#if defined(__AVX2__)
+        if (use_avx2) {
+            // 每次迭代并行处理 16 个 2x2 Bayer 单元（32x2 原图像素）
+            for (; hx + 16U <= half_w; hx += 16U) {
+                const uint32_t x2 = hx * 2U;
+                __m128i vr, vb;
+                if constexpr (Fmt == PixelFormat::BayerRG8) {
+                    vr = extract_16(even + x2, false);
+                    vb = extract_16(odd + x2, true);
+                } else if constexpr (Fmt == PixelFormat::BayerBG8) {
+                    vb = extract_16(even + x2, false);
+                    vr = extract_16(odd + x2, true);
+                } else if constexpr (Fmt == PixelFormat::BayerGR8) {
+                    vr = extract_16(even + x2, true);
+                    vb = extract_16(odd + x2, false);
+                } else {  // BayerGB8
+                    vb = extract_16(even + x2, true);
+                    vr = extract_16(odd + x2, false);
+                }
+
+                const __m128i v_pri = (Color == EnemyColor::Red) ? vr : vb;
+                const __m128i v_sec = (Color == EnemyColor::Red) ? vb : vr;
+
+                // 无符号饱和减法：a > t 等价于 subs_epu8(a, t) != 0
+                const __m128i eq_b = _mm_cmpeq_epi8(_mm_subs_epu8(v_pri, v_bright), v_zero);
+                const __m128i eq_d =
+                    _mm_cmpeq_epi8(_mm_subs_epu8(_mm_subs_epu8(v_pri, v_sec), v_diff), v_zero);
+                const __m128i mask16 = _mm_andnot_si128(_mm_or_si128(eq_b, eq_d), v_all_ff);
+
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(out_row + hx), mask16);
+                if (_mm_movemask_epi8(mask16) != 0) {
+                    any_hit = 1U;
+                }
+            }
+        }
+#endif
+
+        // 标量尾部路径（处理不足 16 块的边界像素，及无 AVX2 平台）
+        for (; hx < half_w; ++hx) {
             const uint32_t x2 = hx * 2U;
             int r = 0;
             int b = 0;
