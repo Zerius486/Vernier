@@ -6,7 +6,7 @@
 
 - **零重型依赖**：无 ROS、无 YOLO、无 TensorRT / OpenVINO / ONNXRuntime；核心仅依赖 C++20 + CMake + OpenCV + Eigen3（按需自动探测海康 MVS 与 CUDA）。
 - **双平台原生适配**：
-  - **Jetson NX (ARM64)**：手写 2 个 CUDA 融合核函数（`bayer_color_thresh_kernel` + `batch_warp_mlp_kernel`）+ `cudaHostAllocMapped` 零拷贝帧池（`-DENABLE_CUDA=ON`）。
+  - **Jetson NX (ARM64)**：手写 3 个 CUDA 融合核函数（`bayer_color_thresh_kernel`、`batch_lightbar_pca_grad_kernel`、`batch_warp_mlp_kernel`）+ `cudaHostAllocMapped` 零拷贝帧池（`-DENABLE_CUDA=ON`）。
   - **Intel NUC (x86_64)**：等价 CPU SIMD (AVX2) + Eigen3 后端，无需安装 CUDA Toolkit。
 - **海康工业相机 (MVS) 零拷贝采集**：强制 `BayerRG8`（1/3 带宽、免 CPU 全图 Demosaic）、关闭自动白平衡/自动曝光、内置原生 Linux `USBDEVFS_RESET` 断线复位（无需 `libusb`）。
 - **亚像素感知与抗脉冲小陀螺估计**：

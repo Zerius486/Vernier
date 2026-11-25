@@ -125,12 +125,15 @@ void ArmorDetector::extract_lightbars_pca(const FrameSlot& frame,
     std::vector<uint32_t> stack;
     stack.reserve(256);
 
-    for (uint32_t hy = 0; hy < mh; ++hy) {
+    std::array<backend::LightbarBboxRequest, backend::kMaxBatchLightbars> bbox_reqs{};
+    size_t bbox_count = 0;
+
+    for (uint32_t hy = 0; hy < mh && bbox_count < backend::kMaxBatchLightbars; ++hy) {
         // 利用活跃行位图直接跳过全黑背景行
         if (mask.row_nonzero[hy] == 0) continue;
 
         const size_t row_off = static_cast<size_t>(hy) * mw;
-        for (uint32_t hx = 0; hx < mw; ++hx) {
+        for (uint32_t hx = 0; hx < mw && bbox_count < backend::kMaxBatchLightbars; ++hx) {
             const size_t idx = row_off + hx;
             if (mask.mask[idx] == 0 || visited_[idx] != 0) continue;
 
@@ -174,194 +177,42 @@ void ArmorDetector::extract_lightbars_pca(const FrameSlot& frame,
 
             if (pixel_count < 3U) continue;
 
-            // 将 1/2 掩码外接框映射回原图局部窗口（外扩 2 像素），用于亚像素 PCA 精修
-            const uint32_t fx0 = (mask.roi_x + min_x * 2U >= 2U) ? (mask.roi_x + min_x * 2U - 2U) : 0U;
-            const uint32_t fy0 = (mask.roi_y + min_y * 2U >= 2U) ? (mask.roi_y + min_y * 2U - 2U) : 0U;
-            const uint32_t fx1 = std::min(frame.width - 1U, mask.roi_x + (max_x + 1U) * 2U + 2U);
-            const uint32_t fy1 = std::min(frame.height - 1U, mask.roi_y + (max_y + 1U) * 2U + 2U);
-
-            // 第 1 遍：计算亮度加权质心
-            double sum_w = 0.0;
-            double sum_x = 0.0;
-            double sum_y = 0.0;
-            const float thresh_f = static_cast<float>(cfg_.brightness_thresh) * 0.5f;
-
-            for (uint32_t y = fy0; y <= fy1; ++y) {
-                const uint8_t* row = frame.host_ptr + static_cast<size_t>(y) * frame.stride;
-                for (uint32_t x = fx0; x <= fx1; ++x) {
-                    const float val = static_cast<float>(row[x]);
-                    if (val <= thresh_f) continue;
-                    const double w = static_cast<double>(val - thresh_f);
-                    sum_w += w;
-                    sum_x += w * static_cast<double>(x);
-                    sum_y += w * static_cast<double>(y);
-                }
-            }
-            if (sum_w <= 1e-6) continue;
-
-            const double cx = sum_x / sum_w;
-            const double cy = sum_y / sum_w;
-
-            // 第 2 遍：计算 2x2 亮度加权协方差矩阵，用于求解 PCA 主轴
-            double cxx = 0.0, cxy = 0.0, cyy = 0.0;
-            for (uint32_t y = fy0; y <= fy1; ++y) {
-                const uint8_t* row = frame.host_ptr + static_cast<size_t>(y) * frame.stride;
-                for (uint32_t x = fx0; x <= fx1; ++x) {
-                    const float val = static_cast<float>(row[x]);
-                    if (val <= thresh_f) continue;
-                    const double w = static_cast<double>(val - thresh_f);
-                    const double dx = static_cast<double>(x) - cx;
-                    const double dy = static_cast<double>(y) - cy;
-                    cxx += w * dx * dx;
-                    cxy += w * dx * dy;
-                    cyy += w * dy * dy;
-                }
-            }
-            cxx /= sum_w;
-            cxy /= sum_w;
-            cyy /= sum_w;
-
-            // 解析求解 2x2 对称协方差矩阵的主特征向量
-            const double trace = cxx + cyy;
-            const double diff = cxx - cyy;
-            const double disc = std::hypot(diff, 2.0 * cxy);
-            const double lambda1 = 0.5 * (trace + disc);
-            const double lambda2 = std::max(1e-6, 0.5 * (trace - disc));
-
-            double ux = 0.0;
-            double uy = 1.0;
-            if (std::fabs(cxy) > 1e-9 || std::fabs(diff) > 1e-9) {
-                const double theta = 0.5 * std::atan2(2.0 * cxy, diff);
-                ux = std::cos(theta);
-                uy = std::sin(theta);
-            }
-            // 统一规定主轴方向朝下（uy >= 0），使上端点对应负投影
-            if (uy < 0.0) {
-                ux = -ux;
-                uy = -uy;
-            }
-
-            // 第 3 遍：沿主轴做 1D 亮度剖面梯度边缘 + 抛物线亚像素端点精修
-            // 先求高亮像素粗略投影范围，再在其外扩区间上定位物理上升/下降沿梯度峰值
-            double min_proj = 1e9;
-            double max_proj = -1e9;
-            for (uint32_t y = fy0; y <= fy1; ++y) {
-                const uint8_t* row = frame.host_ptr + static_cast<size_t>(y) * frame.stride;
-                for (uint32_t x = fx0; x <= fx1; ++x) {
-                    if (static_cast<float>(row[x]) <= thresh_f) continue;
-                    const double proj =
-                        (static_cast<double>(x) - cx) * ux + (static_cast<double>(y) - cy) * uy;
-                    min_proj = std::min(min_proj, proj);
-                    max_proj = std::max(max_proj, proj);
-                }
-            }
-
-            // 沿主轴以 0.5px 步长采样 1D 亮度剖面：
-            // 对 Bayer 原图取 2x2 单元均值（恒含 1R+2G+1B），从数学上彻底消除奇偶行棋盘纹干扰
-            if (max_proj - min_proj >= 4.0) {
-                auto sample_bayer_cell_avg = [&](double px, double py) -> double {
-                    if (px < 0.5 || py < 0.5 ||
-                        px >= static_cast<double>(frame.width - 2U) ||
-                        py >= static_cast<double>(frame.height - 2U)) {
-                        return 0.0;
-                    }
-                    auto bilin = [&](double x, double y) -> double {
-                        const uint32_t x0 = static_cast<uint32_t>(x);
-                        const uint32_t y0 = static_cast<uint32_t>(y);
-                        const double dx = x - static_cast<double>(x0);
-                        const double dy = y - static_cast<double>(y0);
-                        const uint8_t* r0 = frame.host_ptr + static_cast<size_t>(y0) * frame.stride;
-                        const uint8_t* r1 = r0 + frame.stride;
-                        const double top = r0[x0] + dx * (r0[x0 + 1U] - r0[x0]);
-                        const double bot = r1[x0] + dx * (r1[x0 + 1U] - r1[x0]);
-                        return top + dy * (bot - top);
-                    };
-                    return 0.25 * (bilin(px - 0.5, py - 0.5) + bilin(px + 0.5, py - 0.5) +
-                                   bilin(px - 0.5, py + 0.5) + bilin(px + 0.5, py + 0.5));
-                };
-
-                constexpr double kStep = 0.5;
-                const double s_start = min_proj - 3.0;
-                const double s_end = max_proj + 3.0;
-                const int n_samples = static_cast<int>(std::floor((s_end - s_start) / kStep)) + 1;
-                if (n_samples >= 10 && n_samples <= 512) {
-                    double profile[512];
-                    for (int k = 0; k < n_samples; ++k) {
-                        const double s = s_start + k * kStep;
-                        profile[k] = sample_bayer_cell_avg(cx + s * ux, cy + s * uy);
-                    }
-
-                    // 仅在粗略端点 ±3px 邻域内搜索物理上升/下降沿梯度峰值，避免内部反光干扰
-                    const int edge_band = std::min(n_samples / 2, static_cast<int>(6.0 / kStep));
-                    int best_top = -1;
-                    double max_g_top = 8.0;
-                    for (int k = 1; k < edge_band; ++k) {
-                        const double g = profile[k + 1] - profile[k - 1];
-                        if (g > max_g_top) {
-                            max_g_top = g;
-                            best_top = k;
-                        }
-                    }
-
-                    int best_bot = -1;
-                    double max_g_bot = 8.0;
-                    for (int k = n_samples - edge_band; k < n_samples - 1; ++k) {
-                        const double g = profile[k - 1] - profile[k + 1];
-                        if (g > max_g_bot) {
-                            max_g_bot = g;
-                            best_bot = k;
-                        }
-                    }
-
-                    // 抛物线三点亚像素插值精修梯度峰值位置
-                    auto refine_peak = [&](int idx, bool is_rising) -> double {
-                        double sub = 0.0;
-                        if (idx >= 2 && idx <= n_samples - 3) {
-                            const double g_m = is_rising ? (profile[idx] - profile[idx - 2])
-                                                         : (profile[idx - 2] - profile[idx]);
-                            const double g_0 = is_rising ? (profile[idx + 1] - profile[idx - 1])
-                                                         : (profile[idx - 1] - profile[idx + 1]);
-                            const double g_p = is_rising ? (profile[idx + 2] - profile[idx])
-                                                         : (profile[idx] - profile[idx + 2]);
-                            const double denom = g_m - 2.0 * g_0 + g_p;
-                            if (std::fabs(denom) > 1e-6) {
-                                sub = std::clamp(0.5 * (g_m - g_p) / denom, -0.5, 0.5);
-                            }
-                        }
-                        return s_start + (static_cast<double>(idx) + sub) * kStep;
-                    };
-
-                    if (best_top >= 0 && best_bot > best_top) {
-                        min_proj = refine_peak(best_top, true);
-                        max_proj = refine_peak(best_bot, false);
-                    }
-                }
-            }
-
-            const float length = static_cast<float>(max_proj - min_proj);
-            const float width = std::max(1.0f, static_cast<float>(std::sqrt(12.0 * lambda2)));
-            const float ratio = length / width;
-            // 相对竖直方向的倾角（0 度为完全竖直）
-            const float tilt_rad = static_cast<float>(std::atan2(ux, uy));
-            const float tilt_deg = std::fabs(tilt_rad) * kRadToDeg;
-
-            if (length < cfg_.min_lightbar_length) continue;
-            if (ratio < cfg_.min_lightbar_ratio || ratio > cfg_.max_lightbar_ratio) continue;
-            if (tilt_deg > cfg_.max_angle_error_deg) continue;
-            if (lambda1 <= lambda2) continue;
-
-            LightBar lb{};
-            lb.top = {static_cast<float>(cx + min_proj * ux),
-                      static_cast<float>(cy + min_proj * uy)};
-            lb.bottom = {static_cast<float>(cx + max_proj * ux),
-                         static_cast<float>(cy + max_proj * uy)};
-            lb.center = {static_cast<float>(cx), static_cast<float>(cy)};
-            lb.length = length;
-            lb.width = width;
-            lb.angle_rad = tilt_rad;
-            lb.color = enemy_color_;
-            lightbars_.push_back(lb);
+            // 将 1/2 掩码外接框映射回原图局部窗口（外扩 2 像素），交给后端批量执行 PCA + 梯度亚像素精修
+            bbox_reqs[bbox_count++] = backend::LightbarBboxRequest{
+                .fx0 = (mask.roi_x + min_x * 2U >= 2U) ? (mask.roi_x + min_x * 2U - 2U) : 0U,
+                .fy0 = (mask.roi_y + min_y * 2U >= 2U) ? (mask.roi_y + min_y * 2U - 2U) : 0U,
+                .fx1 = std::min(frame.width - 1U, mask.roi_x + (max_x + 1U) * 2U + 2U),
+                .fy1 = std::min(frame.height - 1U, mask.roi_y + (max_y + 1U) * 2U + 2U),
+            };
         }
+    }
+
+    if (bbox_count == 0) return;
+
+    // 一次批量调用计算后端（CPU 或 CUDA Kernel 3）完成所有候选灯条的 PCA + 梯度边缘亚像素精修
+    std::array<backend::LightbarFitResult, backend::kMaxBatchLightbars> fit_results{};
+    backend_.batch_fit_lightbars(frame, bbox_reqs.data(), bbox_count,
+                                 static_cast<float>(cfg_.brightness_thresh), fit_results.data());
+
+    for (size_t k = 0; k < bbox_count; ++k) {
+        const auto& fit = fit_results[k];
+        if (!fit.valid) continue;
+
+        const float ratio = fit.length / std::max(1e-3f, fit.width);
+        const float tilt_deg = std::fabs(fit.angle_rad) * kRadToDeg;
+        if (fit.length < cfg_.min_lightbar_length) continue;
+        if (ratio < cfg_.min_lightbar_ratio || ratio > cfg_.max_lightbar_ratio) continue;
+        if (tilt_deg > cfg_.max_angle_error_deg) continue;
+
+        LightBar lb{};
+        lb.top = fit.top;
+        lb.bottom = fit.bottom;
+        lb.center = fit.center;
+        lb.length = fit.length;
+        lb.width = fit.width;
+        lb.angle_rad = fit.angle_rad;
+        lb.color = enemy_color_;
+        lightbars_.push_back(lb);
     }
 
     // 按 x 坐标从左到右排序，保证配对结果确定性

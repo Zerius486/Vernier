@@ -232,6 +232,20 @@ void test_cpu_vs_cuda_equivalence(const AppConfig& cfg) {
     for (uint32_t c = 0; c < kMlpNumClasses; ++c) {
         CHECK(std::fabs(r_cpu.probs[c] - r_cuda.probs[c]) < 1e-4f);
     }
+
+    // 校验算子 3（batch_fit_lightbars）CPU vs CUDA 亚像素端点等价性 (< 0.05 px)
+    LightbarBboxRequest lb_req{574, 480, 590, 544};
+    LightbarFitResult lb_cpu{}, lb_cuda{};
+    cpu_be->batch_fit_lightbars(slot, &lb_req, 1,
+                                static_cast<float>(cfg.detector.brightness_thresh), &lb_cpu);
+    cuda_be->batch_fit_lightbars(slot, &lb_req, 1,
+                                 static_cast<float>(cfg.detector.brightness_thresh), &lb_cuda);
+    CHECK(lb_cpu.valid == 1 && lb_cuda.valid == 1);
+    CHECK(std::fabs(lb_cpu.top.x - lb_cuda.top.x) < 0.05f);
+    CHECK(std::fabs(lb_cpu.top.y - lb_cuda.top.y) < 0.05f);
+    CHECK(std::fabs(lb_cpu.bottom.x - lb_cuda.bottom.x) < 0.05f);
+    CHECK(std::fabs(lb_cpu.bottom.y - lb_cuda.bottom.y) < 0.05f);
+
     std::cout << "OK (zero-copy=" << (pool.is_cuda_zero_copy() ? "ON" : "OFF") << ")\n";
 #else
     (void)cfg;

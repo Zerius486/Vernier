@@ -12,6 +12,26 @@
 namespace rm_aim::backend {
 
 inline constexpr size_t kMaxBatchArmors = 16;
+inline constexpr size_t kMaxBatchLightbars = 32;
+
+/// 批量灯条亚像素拟合请求（原图分辨率下的粗略外接框）。
+struct LightbarBboxRequest {
+    uint32_t fx0 = 0;
+    uint32_t fy0 = 0;
+    uint32_t fx1 = 0;
+    uint32_t fy1 = 0;
+};
+
+/// 批量灯条 PCA + 梯度边缘亚像素拟合结果。
+struct LightbarFitResult {
+    Point2f top{};
+    Point2f bottom{};
+    Point2f center{};
+    float length = 0.0f;
+    float width = 0.0f;
+    float angle_rad = 0.0f;
+    uint8_t valid = 0;
+};
 
 struct PreprocessParams {
     EnemyColor enemy_color = EnemyColor::Blue;
@@ -67,6 +87,11 @@ public:
     virtual void batch_warp_and_classify(const FrameSlot& frame,
                                          const WarpPatchRequest* requests, size_t count,
                                          ClassifyResult* out_results) = 0;
+
+    /// 算子 3：批量灯条加权 PCA 主轴拟合 + 2x2 Bayer 梯度边缘亚像素端点精修。
+    virtual void batch_fit_lightbars(const FrameSlot& frame, const LightbarBboxRequest* requests,
+                                     size_t count, float brightness_thresh,
+                                     LightbarFitResult* out_results) = 0;
 };
 
 std::unique_ptr<IComputeBackend> create_compute_backend(const MlpWeights& weights,

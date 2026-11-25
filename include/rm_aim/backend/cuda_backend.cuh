@@ -35,6 +35,10 @@ public:
     void batch_warp_and_classify(const FrameSlot& frame, const WarpPatchRequest* requests,
                                  size_t count, ClassifyResult* out_results) override;
 
+    void batch_fit_lightbars(const FrameSlot& frame, const LightbarBboxRequest* requests,
+                             size_t count, float brightness_thresh,
+                             LightbarFitResult* out_results) override;
+
 private:
 #ifdef RM_AIM_WITH_CUDA
     void ensure_mask_capacity(uint32_t half_w, uint32_t half_h);
@@ -64,6 +68,12 @@ private:
     WarpPatchRequest* d_reqs_ = nullptr;
     ClassifyResult* h_results_ = nullptr;
     ClassifyResult* d_results_ = nullptr;
+
+    // 零拷贝 Mapped Pinned 批量灯条 PCA + 梯度亚像素拟合缓冲
+    LightbarBboxRequest* h_lb_reqs_ = nullptr;
+    LightbarBboxRequest* d_lb_reqs_ = nullptr;
+    LightbarFitResult* h_lb_results_ = nullptr;
+    LightbarFitResult* d_lb_results_ = nullptr;
 
     // 备用显存中转区（仅当传入 FrameSlot 未使用 cudaHostAllocMapped 时启用）
     uint8_t* d_stage_frame_ = nullptr;

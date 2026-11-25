@@ -234,6 +234,186 @@ void CpuComputeBackend::batch_warp_and_classify(const FrameSlot& frame,
     }
 }
 
+void CpuComputeBackend::batch_fit_lightbars(const FrameSlot& frame,
+                                            const LightbarBboxRequest* requests, size_t count,
+                                            float brightness_thresh,
+                                            LightbarFitResult* out_results) {
+    if (frame.host_ptr == nullptr || requests == nullptr || out_results == nullptr || count == 0) {
+        return;
+    }
+
+    const size_t n = std::min(count, kMaxBatchLightbars);
+    const float thresh_f = brightness_thresh * 0.5f;
+
+    auto sample_bayer_cell_avg = [&](double px, double py) -> double {
+        if (px < 0.5 || py < 0.5 ||
+            px >= static_cast<double>(frame.width - 2U) ||
+            py >= static_cast<double>(frame.height - 2U)) {
+            return 0.0;
+        }
+        auto bilin = [&](double x, double y) -> double {
+            const uint32_t x0 = static_cast<uint32_t>(x);
+            const uint32_t y0 = static_cast<uint32_t>(y);
+            const double dx = x - static_cast<double>(x0);
+            const double dy = y - static_cast<double>(y0);
+            const uint8_t* r0 = frame.host_ptr + static_cast<size_t>(y0) * frame.stride;
+            const uint8_t* r1 = r0 + frame.stride;
+            const double top = r0[x0] + dx * (r0[x0 + 1U] - r0[x0]);
+            const double bot = r1[x0] + dx * (r1[x0 + 1U] - r1[x0]);
+            return top + dy * (bot - top);
+        };
+        return 0.25 * (bilin(px - 0.5, py - 0.5) + bilin(px + 0.5, py - 0.5) +
+                       bilin(px - 0.5, py + 0.5) + bilin(px + 0.5, py + 0.5));
+    };
+
+    for (size_t k = 0; k < n; ++k) {
+        LightbarFitResult& res = out_results[k];
+        res = LightbarFitResult{};
+
+        const uint32_t fx0 = std::min(requests[k].fx0, frame.width - 1U);
+        const uint32_t fy0 = std::min(requests[k].fy0, frame.height - 1U);
+        const uint32_t fx1 = std::min(requests[k].fx1, frame.width - 1U);
+        const uint32_t fy1 = std::min(requests[k].fy1, frame.height - 1U);
+        if (fx1 <= fx0 || fy1 <= fy0) continue;
+
+        // 阶段 1：亮度加权质心
+        double sum_w = 0.0, sum_x = 0.0, sum_y = 0.0;
+        for (uint32_t y = fy0; y <= fy1; ++y) {
+            const uint8_t* row = frame.host_ptr + static_cast<size_t>(y) * frame.stride;
+            for (uint32_t x = fx0; x <= fx1; ++x) {
+                const float val = static_cast<float>(row[x]);
+                if (val <= thresh_f) continue;
+                const double w = static_cast<double>(val - thresh_f);
+                sum_w += w;
+                sum_x += w * static_cast<double>(x);
+                sum_y += w * static_cast<double>(y);
+            }
+        }
+        if (sum_w <= 1e-6) continue;
+
+        const double cx = sum_x / sum_w;
+        const double cy = sum_y / sum_w;
+
+        // 阶段 2：2x2 加权协方差矩阵与 PCA 主轴解析求解
+        double cxx = 0.0, cxy = 0.0, cyy = 0.0;
+        for (uint32_t y = fy0; y <= fy1; ++y) {
+            const uint8_t* row = frame.host_ptr + static_cast<size_t>(y) * frame.stride;
+            for (uint32_t x = fx0; x <= fx1; ++x) {
+                const float val = static_cast<float>(row[x]);
+                if (val <= thresh_f) continue;
+                const double w = static_cast<double>(val - thresh_f);
+                const double dx = static_cast<double>(x) - cx;
+                const double dy = static_cast<double>(y) - cy;
+                cxx += w * dx * dx;
+                cxy += w * dx * dy;
+                cyy += w * dy * dy;
+            }
+        }
+        cxx /= sum_w;
+        cxy /= sum_w;
+        cyy /= sum_w;
+
+        const double trace = cxx + cyy;
+        const double diff = cxx - cyy;
+        const double disc = std::hypot(diff, 2.0 * cxy);
+        const double lambda1 = 0.5 * (trace + disc);
+        const double lambda2 = std::max(1e-6, 0.5 * (trace - disc));
+        if (lambda1 <= lambda2) continue;
+
+        double ux = 0.0, uy = 1.0;
+        if (std::fabs(cxy) > 1e-9 || std::fabs(diff) > 1e-9) {
+            const double theta = 0.5 * std::atan2(2.0 * cxy, diff);
+            ux = std::cos(theta);
+            uy = std::sin(theta);
+        }
+        if (uy < 0.0) {
+            ux = -ux;
+            uy = -uy;
+        }
+
+        // 阶段 3：高亮像素粗略端点投影范围
+        double min_proj = 1e9, max_proj = -1e9;
+        for (uint32_t y = fy0; y <= fy1; ++y) {
+            const uint8_t* row = frame.host_ptr + static_cast<size_t>(y) * frame.stride;
+            for (uint32_t x = fx0; x <= fx1; ++x) {
+                if (static_cast<float>(row[x]) <= thresh_f) continue;
+                const double proj =
+                    (static_cast<double>(x) - cx) * ux + (static_cast<double>(y) - cy) * uy;
+                min_proj = std::min(min_proj, proj);
+                max_proj = std::max(max_proj, proj);
+            }
+        }
+
+        // 阶段 4：2x2 Bayer 单元均值 1D 亮度剖面 + 梯度峰值抛物线亚像素端点精修
+        if (max_proj - min_proj >= 4.0) {
+            constexpr double kStep = 0.5;
+            const double s_start = min_proj - 3.0;
+            const double s_end = max_proj + 3.0;
+            const int n_samples = static_cast<int>(std::floor((s_end - s_start) / kStep)) + 1;
+            if (n_samples >= 10 && n_samples <= 512) {
+                double profile[512];
+                for (int i = 0; i < n_samples; ++i) {
+                    const double s = s_start + i * kStep;
+                    profile[i] = sample_bayer_cell_avg(cx + s * ux, cy + s * uy);
+                }
+
+                const int edge_band = std::min(n_samples / 2, static_cast<int>(6.0 / kStep));
+                int best_top = -1;
+                double max_g_top = 8.0;
+                for (int i = 1; i < edge_band; ++i) {
+                    const double g = profile[i + 1] - profile[i - 1];
+                    if (g > max_g_top) {
+                        max_g_top = g;
+                        best_top = i;
+                    }
+                }
+
+                int best_bot = -1;
+                double max_g_bot = 8.0;
+                for (int i = n_samples - edge_band; i < n_samples - 1; ++i) {
+                    const double g = profile[i - 1] - profile[i + 1];
+                    if (g > max_g_bot) {
+                        max_g_bot = g;
+                        best_bot = i;
+                    }
+                }
+
+                auto refine_peak = [&](int idx, bool is_rising) -> double {
+                    double sub = 0.0;
+                    if (idx >= 2 && idx <= n_samples - 3) {
+                        const double g_m = is_rising ? (profile[idx] - profile[idx - 2])
+                                                     : (profile[idx - 2] - profile[idx]);
+                        const double g_0 = is_rising ? (profile[idx + 1] - profile[idx - 1])
+                                                     : (profile[idx - 1] - profile[idx + 1]);
+                        const double g_p = is_rising ? (profile[idx + 2] - profile[idx])
+                                                     : (profile[idx] - profile[idx + 2]);
+                        const double denom = g_m - 2.0 * g_0 + g_p;
+                        if (std::fabs(denom) > 1e-6) {
+                            sub = std::clamp(0.5 * (g_m - g_p) / denom, -0.5, 0.5);
+                        }
+                    }
+                    return s_start + (static_cast<double>(idx) + sub) * kStep;
+                };
+
+                if (best_top >= 0 && best_bot > best_top) {
+                    min_proj = refine_peak(best_top, true);
+                    max_proj = refine_peak(best_bot, false);
+                }
+            }
+        }
+
+        res.top = {static_cast<float>(cx + min_proj * ux),
+                   static_cast<float>(cy + min_proj * uy)};
+        res.bottom = {static_cast<float>(cx + max_proj * ux),
+                      static_cast<float>(cy + max_proj * uy)};
+        res.center = {static_cast<float>(cx), static_cast<float>(cy)};
+        res.length = static_cast<float>(max_proj - min_proj);
+        res.width = std::max(1.0f, static_cast<float>(std::sqrt(12.0 * lambda2)));
+        res.angle_rad = static_cast<float>(std::atan2(ux, uy));
+        res.valid = 1U;
+    }
+}
+
 std::unique_ptr<IComputeBackend> create_compute_backend(const MlpWeights& weights,
                                                         bool prefer_cuda) {
 #ifdef RM_AIM_WITH_CUDA

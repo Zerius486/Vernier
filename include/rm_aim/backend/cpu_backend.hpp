@@ -18,6 +18,10 @@ public:
     void batch_warp_and_classify(const FrameSlot& frame, const WarpPatchRequest* requests,
                                  size_t count, ClassifyResult* out_results) override;
 
+    void batch_fit_lightbars(const FrameSlot& frame, const LightbarBboxRequest* requests,
+                             size_t count, float brightness_thresh,
+                             LightbarFitResult* out_results) override;
+
 private:
     MlpWeights weights_;
 };
