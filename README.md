@@ -80,9 +80,13 @@ cmake --build build --target vernier_calib -j$(nproc)
 ./build/vernier_follow config/default.yaml
 ./build/vernier_follow config/default.yaml --no-ff --mjpeg
 
-# 3. 可选 SSH 无头标定与校准工具（需 -DRM_AIM_BUILD_CALIB=ON）
+# 3. 可选 SSH 无头标定与样本导出工具（需 -DRM_AIM_BUILD_CALIB=ON）
 ./build/vernier_calib intrinsic config/default.yaml --cols 9 --rows 6 --square 0.025
 ./build/vernier_calib sync config/default.yaml --duration 6
+./build/vernier_calib dump_digits config/default.yaml --input records/capture.rmraw --out dataset/raw
+
+# 4. 实车无头开机自启与崩溃守护（systemd）
+./scripts/install_service.sh
 ```
 
 ### 上车纯跟随 3 步安全联调流程（SSH）

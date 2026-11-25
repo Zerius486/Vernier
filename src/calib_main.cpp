@@ -45,7 +45,9 @@ void print_usage(const char* prog) {
               << " intrinsic [config.yaml] [--cols 9] [--rows 6] [--square 0.025] [--port 8080]\n"
               << "     终端按键: [Enter] 抓拍当前有效棋盘格帧 | [c] 开始解算 | [q] 退出\n\n"
               << "  2) 软同步时间差 + 外参旋转联合校准（静止装甲板 + 甩云台）:\n"
-              << "     " << prog << " sync [config.yaml] [--duration 6] [--port 8080]\n";
+              << "     " << prog << " sync [config.yaml] [--duration 6] [--port 8080]\n\n"
+              << "  3) 从 .rmraw 录包导出 28x20 轻量 MLP 数字训练样本:\n"
+              << "     " << prog << " dump_digits [config.yaml] --input capture.rmraw --out dataset/raw [--stride 3]\n";
 }
 
 /// 非阻塞读取一行标准输入命令（用于 SSH 终端交互）
@@ -440,6 +442,114 @@ int run_sync_extrinsic_calib(const rm_aim::AppConfig& cfg, double duration_s,
     return 0;
 }
 
+// ============================================================================
+// 子命令 3：从 .rmraw 录包导出与运行期完全一致的 28x20 数字训练样本（dump_digits）
+// ============================================================================
+int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
+                    const std::string& out_dir, int frame_stride) {
+    if (input_path.empty()) {
+        std::cerr << "[Calib-Dump] 请通过 --input 指定 .rmraw 录包路径。\n";
+        return 1;
+    }
+
+    std::ifstream file(input_path, std::ios::binary);
+    if (!file.is_open()) {
+        std::cerr << "[Calib-Dump] 无法打开录包文件: " << input_path << "\n";
+        return 1;
+    }
+
+    rm_aim::hal::RawFileHeader hdr{};
+    file.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!file.good() || std::memcmp(hdr.magic, "RMRAW001", 8) != 0) {
+        std::cerr << "[Calib-Dump] 无效的 .rmraw 文件头。\n";
+        return 1;
+    }
+
+    std::filesystem::create_directories(out_dir);
+
+    // 使用占位权重放行所有几何配对成功的候选装甲板，以便完整收集正/负样本
+    rm_aim::backend::MlpWeights dummy = rm_aim::backend::MlpWeights::make_dummy(3);
+    auto backend = rm_aim::backend::create_compute_backend(dummy, false);
+    rm_aim::DetectorConfig det_cfg = cfg.detector;
+    det_cfg.use_dynamic_roi = false;
+    det_cfg.min_confidence = 0.0f;
+    rm_aim::perception::ArmorDetector detector(det_cfg, cfg.enemy_color, *backend);
+
+    std::vector<uint8_t> raw_buf;
+    uint64_t frame_idx = 0;
+    uint64_t saved_crops = 0;
+    const int stride_step = std::max(1, frame_stride);
+
+    while (!g_stop.load(std::memory_order_acquire)) {
+        rm_aim::hal::RawFrameHeader fhdr{};
+        file.read(reinterpret_cast<char*>(&fhdr), sizeof(fhdr));
+        if (!file.good()) break;
+
+        raw_buf.resize(fhdr.byte_size);
+        file.read(reinterpret_cast<char*>(raw_buf.data()),
+                  static_cast<std::streamsize>(fhdr.byte_size));
+        if (!file.good()) break;
+
+        if ((frame_idx++ % static_cast<uint64_t>(stride_step)) != 0) continue;
+
+        rm_aim::FrameSlot slot{};
+        slot.host_ptr = raw_buf.data();
+        slot.capacity = raw_buf.size();
+        slot.width = fhdr.width;
+        slot.height = fhdr.height;
+        slot.stride = fhdr.stride;
+        slot.byte_size = fhdr.byte_size;
+        slot.format = static_cast<rm_aim::PixelFormat>(fhdr.format);
+        slot.frame_id = fhdr.frame_id;
+        slot.timestamp_ns = fhdr.timestamp_ns;
+
+        const auto armors = detector.detect(slot);
+        cv::Mat raw_gray(static_cast<int>(slot.height), static_cast<int>(slot.width), CV_8UC1,
+                         slot.host_ptr, slot.stride);
+
+        for (size_t i = 0; i < armors.size(); ++i) {
+            // 与运行期 detector.cpp 完全一致的上下 2x 外扩数字区域裁剪
+            const auto& c = armors[i].corners;
+            const auto expand_pair = [](rm_aim::Point2f top, rm_aim::Point2f bot) {
+                const rm_aim::Point2f mid{0.5f * (top.x + bot.x), 0.5f * (top.y + bot.y)};
+                return std::pair<cv::Point2f, cv::Point2f>{
+                    {mid.x + (top.x - mid.x) * 2.0f, mid.y + (top.y - mid.y) * 2.0f},
+                    {mid.x + (bot.x - mid.x) * 2.0f, mid.y + (bot.y - mid.y) * 2.0f}};
+            };
+            const auto [lt, lb] = expand_pair(c[0], c[3]);
+            const auto [rt, rb] = expand_pair(c[1], c[2]);
+
+            const std::vector<cv::Point2f> src_pts = {lt, rt, rb, lb};
+            const std::vector<cv::Point2f> dst_pts = {
+                {0.0f, 0.0f},
+                {static_cast<float>(rm_aim::backend::kMlpInputW - 1U), 0.0f},
+                {static_cast<float>(rm_aim::backend::kMlpInputW - 1U),
+                 static_cast<float>(rm_aim::backend::kMlpInputH - 1U)},
+                {0.0f, static_cast<float>(rm_aim::backend::kMlpInputH - 1U)},
+            };
+
+            const cv::Mat M = cv::getPerspectiveTransform(src_pts, dst_pts);
+            cv::Mat patch;
+            cv::warpPerspective(raw_gray, patch, M,
+                                cv::Size(static_cast<int>(rm_aim::backend::kMlpInputW),
+                                         static_cast<int>(rm_aim::backend::kMlpInputH)),
+                                cv::INTER_LINEAR);
+
+            const std::string out_file =
+                (std::filesystem::path(out_dir) /
+                 ("f" + std::to_string(fhdr.frame_id) + "_a" + std::to_string(i) + ".png"))
+                    .string();
+            if (cv::imwrite(out_file, patch)) {
+                ++saved_crops;
+            }
+        }
+    }
+
+    std::cout << "[Calib-Dump] 导出完成：扫描 " << frame_idx << " 帧，输出 "
+              << saved_crops << " 张 28x20 数字样本至 " << out_dir << "\n";
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -458,6 +568,9 @@ int main(int argc, char** argv) {
     float square = 0.025f;
     double duration = 6.0;
     uint16_t port = 8080;
+    std::string input_path;
+    std::string out_dir = "dataset/raw";
+    int stride = 3;
 
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -471,6 +584,12 @@ int main(int argc, char** argv) {
             duration = std::stod(argv[++i]);
         } else if (a == "--port" && i + 1 < argc) {
             port = static_cast<uint16_t>(std::stoul(argv[++i]));
+        } else if (a == "--input" && i + 1 < argc) {
+            input_path = argv[++i];
+        } else if (a == "--out" && i + 1 < argc) {
+            out_dir = argv[++i];
+        } else if (a == "--stride" && i + 1 < argc) {
+            stride = std::stoi(argv[++i]);
         } else if (!a.empty() && a[0] != '-') {
             cfg_path = a;
         }
@@ -489,6 +608,9 @@ int main(int argc, char** argv) {
     }
     if (mode == "sync") {
         return run_sync_extrinsic_calib(cfg, duration, port);
+    }
+    if (mode == "dump_digits") {
+        return run_dump_digits(cfg, input_path, out_dir, stride);
     }
 
     std::cerr << "[Vernier-Calib] 未知子命令: " << mode << "\n";

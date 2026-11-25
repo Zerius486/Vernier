@@ -138,34 +138,42 @@ int main(int argc, char** argv) {
         auto armors = detector.detect(*slot, &timing);
 
         rm_aim::ImuSample synced_imu{};
-        if (!imu_buffer.query(slot->timestamp_ns, synced_imu)) {
+        const bool has_imu = imu_buffer.query(slot->timestamp_ns, synced_imu);
+        if (!has_imu) {
             synced_imu.timestamp_ns = slot->timestamp_ns;
+            synced_imu.mode = 1U;
             synced_imu.q = {1.0f, 0.0f, 0.0f, 0.0f};
             synced_imu.bullet_speed = 24.0f;
         }
 
         rm_aim::GimbalCmd cmd{};
 #ifdef RM_AIM_WITH_EIGEN
-        Eigen::Matrix3d R_w2c;
-        Eigen::Vector3d t_w2c;
-        rm_aim::estimation::compute_world_to_cam_transform(synced_imu, cfg.extrinsics, R_w2c, t_w2c);
+        if (has_imu && synced_imu.mode == 0U) {
+            tracker.reset();
+            detector.reset_roi();
+        } else {
+            Eigen::Matrix3d R_w2c;
+            Eigen::Vector3d t_w2c;
+            rm_aim::estimation::compute_world_to_cam_transform(synced_imu, cfg.extrinsics, R_w2c,
+                                                               t_w2c);
 
-        std::vector<rm_aim::estimation::WorldArmorObs> world_obs;
-        world_obs.reserve(armors.size());
-        for (auto& a : armors) {
-            if (pnp_solver.solve(a)) {
-                auto obs =
-                    rm_aim::estimation::transform_armor_to_world(a, synced_imu, cfg.extrinsics);
-                // 去畸变 + 物理倾角约束下的 4-DoF 联合位姿精修（前哨站 -15°，其余 +15°）
-                constexpr double kDeg15 = 15.0 * 3.14159265358979323846 / 180.0;
-                const double armor_pitch = (a.class_id == 6) ? -kDeg15 : kDeg15;
-                pnp_solver.refine_pose_4dof(a, obs.pos_world, obs.yaw_world, R_w2c, t_w2c,
-                                            armor_pitch);
-                world_obs.push_back(obs);
+            std::vector<rm_aim::estimation::WorldArmorObs> world_obs;
+            world_obs.reserve(armors.size());
+            for (auto& a : armors) {
+                if (pnp_solver.solve(a)) {
+                    auto obs =
+                        rm_aim::estimation::transform_armor_to_world(a, synced_imu, cfg.extrinsics);
+                    // 去畸变 + 物理倾角约束下的 4-DoF 联合位姿精修（前哨站 -15°，其余 +15°）
+                    constexpr double kDeg15 = 15.0 * 3.14159265358979323846 / 180.0;
+                    const double armor_pitch = (a.class_id == 6) ? -kDeg15 : kDeg15;
+                    pnp_solver.refine_pose_4dof(a, obs.pos_world, obs.yaw_world, R_w2c, t_w2c,
+                                                armor_pitch);
+                    world_obs.push_back(obs);
+                }
             }
+            tracker.update(slot->timestamp_ns, world_obs);
+            cmd = aimer.compute_command(tracker, synced_imu);
         }
-        tracker.update(slot->timestamp_ns, world_obs);
-        cmd = aimer.compute_command(tracker, synced_imu);
 #else
         (void)pnp_solver;
 #endif
@@ -186,12 +194,18 @@ int main(int argc, char** argv) {
         serial->send_command(cmd);
 
 #ifdef RM_AIM_WITH_OPENCV
-        // 仅当有浏览器连接时才解码标注并推送，无人观看时 0 CPU 开销
+        // 仅当有浏览器连接时才按实际 Bayer 排布解码标注并推送，无人观看时 0 CPU 开销
         if (cfg.debug.enable_mjpeg && mjpeg.has_clients() && slot->width > 0 && slot->height > 0) {
             cv::Mat raw(static_cast<int>(slot->height), static_cast<int>(slot->width),
                         CV_8UC1, slot->host_ptr, slot->stride);
             cv::Mat bgr;
-            cv::cvtColor(raw, bgr, cv::COLOR_BayerRG2BGR);
+            switch (slot->format) {
+                case rm_aim::PixelFormat::BayerRG8: cv::cvtColor(raw, bgr, cv::COLOR_BayerRG2BGR); break;
+                case rm_aim::PixelFormat::BayerBG8: cv::cvtColor(raw, bgr, cv::COLOR_BayerBG2BGR); break;
+                case rm_aim::PixelFormat::BayerGR8: cv::cvtColor(raw, bgr, cv::COLOR_BayerGR2BGR); break;
+                case rm_aim::PixelFormat::BayerGB8: cv::cvtColor(raw, bgr, cv::COLOR_BayerGB2BGR); break;
+                default: cv::cvtColor(raw, bgr, cv::COLOR_GRAY2BGR); break;
+            }
             for (const auto& a : armors) {
                 for (int i = 0; i < 4; ++i) {
                     const auto& p0 = a.corners[static_cast<size_t>(i)];
