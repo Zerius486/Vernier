@@ -1,59 +1,15 @@
-#include "rm_aim/perception/detector.hpp"
+#include "rm_aim/perception/lightbar_detector.hpp"
+#include "rm_aim/perception/detector_utils.hpp"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <numbers>
 
-#ifdef RM_AIM_WITH_EIGEN
-#include <Eigen/Dense>
-#endif
-
 namespace rm_aim::perception {
 namespace {
 
 constexpr float kRadToDeg = 180.0f / std::numbers::pi_v<float>;
-
-/// 计算 3x3 逆透视单应矩阵，将归一化数字图四角
-/// (0,0), (W-1,0), (W-1,H-1), (0,H-1) 映射回原图四边形（左上、右上、右下、左下）。
-bool compute_patch_homography(const std::array<Point2f, 4>& dst, std::array<float, 9>& h_out) {
-    constexpr float W = static_cast<float>(backend::kMlpInputW - 1U);
-    constexpr float H = static_cast<float>(backend::kMlpInputH - 1U);
-    const std::array<Point2f, 4> src = {
-        Point2f{0.0f, 0.0f},
-        Point2f{W, 0.0f},
-        Point2f{W, H},
-        Point2f{0.0f, H},
-    };
-
-#ifdef RM_AIM_WITH_EIGEN
-    Eigen::Matrix<double, 8, 8> A;
-    Eigen::Matrix<double, 8, 1> b;
-    for (int i = 0; i < 4; ++i) {
-        const double u = src[i].x;
-        const double v = src[i].y;
-        const double x = dst[i].x;
-        const double y = dst[i].y;
-        A.row(2 * i) << u, v, 1.0, 0.0, 0.0, 0.0, -x * u, -x * v;
-        b(2 * i) = x;
-        A.row(2 * i + 1) << 0.0, 0.0, 0.0, u, v, 1.0, -y * u, -y * v;
-        b(2 * i + 1) = y;
-    }
-
-    const Eigen::Matrix<double, 8, 1> sol = A.partialPivLu().solve(b);
-    if (!sol.allFinite()) return false;
-
-    for (int i = 0; i < 8; ++i) {
-        h_out[static_cast<size_t>(i)] = static_cast<float>(sol(i));
-    }
-    h_out[8] = 1.0f;
-    return true;
-#else
-    (void)dst;
-    h_out = {1, 0, 0, 0, 1, 0, 0, 0, 1};
-    return false;
-#endif
-}
 
 inline float dist2d(Point2f a, Point2f b) noexcept {
     return std::hypot(a.x - b.x, a.y - b.y);
@@ -61,11 +17,11 @@ inline float dist2d(Point2f a, Point2f b) noexcept {
 
 }  // namespace
 
-ArmorDetector::ArmorDetector(DetectorConfig cfg, EnemyColor enemy_color,
-                             backend::IComputeBackend& backend)
+LightbarDetector::LightbarDetector(DetectorConfig cfg, EnemyColor enemy_color,
+                                   backend::IComputeBackend& backend)
     : cfg_(std::move(cfg)), enemy_color_(enemy_color), backend_(backend) {}
 
-std::vector<Armor> ArmorDetector::detect(const FrameSlot& frame, DetectTimingUs* timing) {
+std::vector<Armor> LightbarDetector::detect(const FrameSlot& frame, DetectTimingUs* timing) {
     const auto t0 = Clock::now();
     std::vector<Armor> armors;
 
@@ -97,12 +53,13 @@ std::vector<Armor> ArmorDetector::detect(const FrameSlot& frame, DetectTimingUs*
         pair_armors_and_classify(frame, armors);
     }
 
-    update_dynamic_roi(frame, armors);
+    detail::update_dynamic_roi_state(cfg_, frame, armors, has_roi_, current_roi_,
+                                     roi_frame_counter_);
 
     if (timing != nullptr) {
         timing->preprocess_us =
             std::chrono::duration<double, std::micro>(t1 - t0).count();
-        timing->lightbar_pca_us =
+        timing->feature_extract_us =
             std::chrono::duration<double, std::micro>(t2 - t1).count();
         timing->pair_and_classify_us =
             std::chrono::duration<double, std::micro>(t3 - t2).count();
@@ -113,8 +70,8 @@ std::vector<Armor> ArmorDetector::detect(const FrameSlot& frame, DetectTimingUs*
     return armors;
 }
 
-void ArmorDetector::extract_lightbars_pca(const FrameSlot& frame,
-                                          const backend::HalfMaskBuffer& mask) {
+void LightbarDetector::extract_lightbars_pca(const FrameSlot& frame,
+                                             const backend::HalfMaskBuffer& mask) {
     lightbars_.clear();
     if (mask.width == 0 || mask.height == 0) return;
 
@@ -220,8 +177,8 @@ void ArmorDetector::extract_lightbars_pca(const FrameSlot& frame,
               [](const LightBar& a, const LightBar& b) { return a.center.x < b.center.x; });
 }
 
-void ArmorDetector::pair_armors_and_classify(const FrameSlot& frame,
-                                             std::vector<Armor>& out_armors) {
+void LightbarDetector::pair_armors_and_classify(const FrameSlot& frame,
+                                                std::vector<Armor>& out_armors) {
     struct Candidate {
         Armor armor;
         backend::WarpPatchRequest req;
@@ -273,7 +230,7 @@ void ArmorDetector::pair_armors_and_classify(const FrameSlot& frame,
             };
 
             Candidate cand{};
-            if (!compute_patch_homography(crop_quad, cand.req.h_inv)) {
+            if (!detail::compute_patch_homography(crop_quad, cand.req.h_inv)) {
                 continue;
             }
 
@@ -309,44 +266,10 @@ void ArmorDetector::pair_armors_and_classify(const FrameSlot& frame,
     }
 }
 
-void ArmorDetector::update_dynamic_roi(const FrameSlot& frame, const std::vector<Armor>& armors) {
-    if (!cfg_.use_dynamic_roi || armors.empty()) {
-        has_roi_ = false;
-        roi_frame_counter_ = 0;
-        return;
-    }
-
-    float min_x = static_cast<float>(frame.width);
-    float min_y = static_cast<float>(frame.height);
-    float max_x = 0.0f;
-    float max_y = 0.0f;
-    for (const auto& a : armors) {
-        for (const auto& c : a.corners) {
-            min_x = std::min(min_x, c.x);
-            min_y = std::min(min_y, c.y);
-            max_x = std::max(max_x, c.x);
-            max_y = std::max(max_y, c.y);
-        }
-    }
-
-    const float cx = 0.5f * (min_x + max_x);
-    const float cy = 0.5f * (min_y + max_y);
-    const float half_w = std::max(64.0f, 0.5f * (max_x - min_x) * cfg_.roi_scale);
-    const float half_h = std::max(64.0f, 0.5f * (max_y - min_y) * cfg_.roi_scale);
-
-    const uint32_t x0 = static_cast<uint32_t>(std::max(0.0f, cx - half_w)) & ~1U;
-    const uint32_t y0 = static_cast<uint32_t>(std::max(0.0f, cy - half_h)) & ~1U;
-    const uint32_t x1 = std::min(frame.width, static_cast<uint32_t>(cx + half_w)) & ~1U;
-    const uint32_t y1 = std::min(frame.height, static_cast<uint32_t>(cy + half_h)) & ~1U;
-
-    if (x1 > x0 + 16U && y1 > y0 + 16U) {
-        current_roi_ = RoiRect{x0, y0, x1 - x0, y1 - y0};
-        has_roi_ = true;
-        ++roi_frame_counter_;
-    } else {
-        has_roi_ = false;
-        roi_frame_counter_ = 0;
-    }
+std::unique_ptr<IArmorDetector> create_armor_detector(const DetectorConfig& cfg,
+                                                      EnemyColor enemy_color,
+                                                      backend::IComputeBackend& backend) {
+    return std::make_unique<LightbarDetector>(cfg, enemy_color, backend);
 }
 
 }  // namespace rm_aim::perception

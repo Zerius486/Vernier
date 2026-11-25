@@ -60,6 +60,7 @@ detector:
   use_dynamic_roi: true
   roi_scale: 2.5
   full_scan_interval: 15
+  # 点阵装甲板专属参数预留区（待官方样式公布后补充，配合 -DRM_AIM_FEATURE_TYPE=DOTMATRIX 使用）
 
 tracker:
   min_detect_count: 5

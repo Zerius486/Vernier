@@ -14,6 +14,9 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 set(ENABLE_CUDA "AUTO" CACHE STRING "是否启用手写 CUDA 融合后端：AUTO / ON / OFF")
 set_property(CACHE ENABLE_CUDA PROPERTY STRINGS AUTO ON OFF)
 
+set(RM_AIM_FEATURE_TYPE "LIGHTBAR" CACHE STRING "装甲板视觉特征类型：LIGHTBAR（传统灯条）或 DOTMATRIX（点阵留空占位接口）")
+set_property(CACHE RM_AIM_FEATURE_TYPE PROPERTY STRINGS LIGHTBAR DOTMATRIX)
+
 option(RM_AIM_ENABLE_NATIVE_OPT "在 Release 构建中启用 -march=native / SIMD 指令优化" ON)
 option(RM_AIM_BUILD_TESTS "构建单元测试与性能基准" ON)
 option(RM_AIM_BUILD_CALIB "构建 SSH 无头标定与校准工具 vernier_calib（可选）" OFF)
@@ -79,9 +82,18 @@ else()
     message(STATUS "Compute backend: CPU (SIMD + Eigen)")
 endif()
 
+if(RM_AIM_FEATURE_TYPE STREQUAL "LIGHTBAR")
+    set(_rm_aim_detector_src "src/perception/lightbar_detector.cpp")
+elseif(RM_AIM_FEATURE_TYPE STREQUAL "DOTMATRIX")
+    set(_rm_aim_detector_src "src/perception/dotmatrix_detector.cpp")
+else()
+    message(FATAL_ERROR "未知的 RM_AIM_FEATURE_TYPE: ${RM_AIM_FEATURE_TYPE}，仅支持 LIGHTBAR 或 DOTMATRIX")
+endif()
+
 message(STATUS "Hikvision MVS SDK: ${MVS_FOUND}")
 message(STATUS "OpenCV found:      ${OpenCV_FOUND}")
 message(STATUS "Eigen3 found:      ${Eigen3_FOUND}")
+message(STATUS "Armor feature:     ${RM_AIM_FEATURE_TYPE}")
 
 # ---------------------------------------------------------------------------
 # 核心库：Core + HAL + Backend + Perception + Estimation + Debug（Phase 1~4）
@@ -91,7 +103,7 @@ set(RM_AIM_CORE_SOURCES
     src/hal/serial.cpp
     src/hal/replay_camera.cpp
     src/backend/cpu_backend.cpp
-    src/perception/detector.cpp
+    ${_rm_aim_detector_src}
     src/perception/pnp_solver.cpp
     src/estimation/imu_buffer.cpp
     src/estimation/ekf_tracker.cpp
@@ -118,6 +130,12 @@ target_link_libraries(rm_aim_core PUBLIC
     rm_aim_compile_options
     Threads::Threads
 )
+
+if(RM_AIM_FEATURE_TYPE STREQUAL "LIGHTBAR")
+    target_compile_definitions(rm_aim_core PUBLIC RM_AIM_FEATURE_LIGHTBAR=1)
+elseif(RM_AIM_FEATURE_TYPE STREQUAL "DOTMATRIX")
+    target_compile_definitions(rm_aim_core PUBLIC RM_AIM_FEATURE_DOTMATRIX=1)
+endif()
 
 if(MVS_FOUND)
     target_link_libraries(rm_aim_core PUBLIC MVS::MVS)

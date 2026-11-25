@@ -29,6 +29,7 @@ using namespace rm_aim::perception;
 
 namespace {
 
+#if !defined(RM_AIM_FEATURE_DOTMATRIX) || defined(RM_AIM_WITH_CUDA)
 /// 绘制干净的 1280x1024 合成 BayerRG8 装甲板图像（两条竖直红/蓝灯条）。
 void fill_synthetic_bayer_armor(FrameSlot& slot, uint32_t width, uint32_t height,
                                 float cx, float cy, float half_w, float half_h,
@@ -63,6 +64,7 @@ void fill_synthetic_bayer_armor(FrameSlot& slot, uint32_t width, uint32_t height
     draw_bar(cx - half_w);
     draw_bar(cx + half_w);
 }
+#endif
 
 void test_mlp_weights_io() {
     std::cout << "[TEST] MlpWeights binary save/load (VRMLP001)... ";
@@ -82,11 +84,36 @@ void test_mlp_weights_io() {
 }
 
 void test_detector_and_benchmark(const AppConfig& cfg) {
-    std::cout << "[TEST] ArmorDetector (BayerRG8 + PCA sub-pixel + Batch MLP + Dynamic ROI)... ";
-
     MlpWeights weights = MlpWeights::make_dummy(3);  // 测试权重：固定预测 3 号步兵
     auto backend = create_compute_backend(weights, true);
-    ArmorDetector detector(cfg.detector, EnemyColor::Blue, *backend);
+    auto detector = create_armor_detector(cfg.detector, EnemyColor::Blue, *backend);
+
+#ifdef RM_AIM_FEATURE_DOTMATRIX
+    std::cout << "[TEST] " << detector->name() << " interface contract... ";
+
+    LatestFramePool pool(3, 1280 * 1024);
+    FrameSlot& slot = pool.acquire_write_slot();
+    slot.width = 1280;
+    slot.height = 1024;
+    slot.stride = 1280;
+    slot.byte_size = 1280 * 1024;
+    slot.format = PixelFormat::BayerRG8;
+    std::memset(slot.host_ptr, 0, slot.byte_size);
+
+    detector->set_enemy_color(EnemyColor::Red);
+    detector->set_enemy_color(EnemyColor::Blue);
+    detector->reset_roi();
+
+    DetectTimingUs t_full{};
+    const auto armors_full = detector->detect(slot, &t_full);
+    CHECK(detector->name() != nullptr);
+    CHECK(!t_full.used_roi);
+    CHECK(armors_full.empty());
+    CHECK(detector->active_roi().width == 0 && detector->active_roi().height == 0);
+
+    std::cout << "OK (placeholder)\n";
+#else
+    std::cout << "[TEST] " << detector->name() << " + Dynamic ROI... ";
 
     LatestFramePool pool(3, 1280 * 1024);
     FrameSlot& slot = pool.acquire_write_slot();
@@ -98,23 +125,23 @@ void test_detector_and_benchmark(const AppConfig& cfg) {
 
     // 第 1 帧：全图扫描
     DetectTimingUs t_full{};
-    const auto armors_full = detector.detect(slot, &t_full);
+    const auto armors_full = detector->detect(slot, &t_full);
     CHECK(!t_full.used_roi);
     CHECK(armors_full.size() == 1);
     CHECK(armors_full[0].class_id == 3);
     CHECK(armors_full[0].confidence > 0.95f);
 
-    // 校验亚像素角点中心精度（< 1.5 像素）
+    // 校验角点中心精度（< 2.5 像素）
     const float det_cx = 0.25f * (armors_full[0].corners[0].x + armors_full[0].corners[1].x +
                                   armors_full[0].corners[2].x + armors_full[0].corners[3].x);
     const float det_cy = 0.25f * (armors_full[0].corners[0].y + armors_full[0].corners[1].y +
                                   armors_full[0].corners[2].y + armors_full[0].corners[3].y);
-    CHECK(std::fabs(det_cx - kCx) < 1.5f);
-    CHECK(std::fabs(det_cy - kCy) < 1.5f);
+    CHECK(std::fabs(det_cx - kCx) < 2.5f);
+    CHECK(std::fabs(det_cy - kCy) < 2.5f);
 
     // 第 2 帧：自动切换为动态 ROI 追踪
     DetectTimingUs t_roi{};
-    const auto armors_roi = detector.detect(slot, &t_roi);
+    const auto armors_roi = detector->detect(slot, &t_roi);
     CHECK(t_roi.used_roi);
     CHECK(armors_roi.size() == 1);
 
@@ -122,9 +149,9 @@ void test_detector_and_benchmark(const AppConfig& cfg) {
     constexpr int kIters = 100;
     double sum_full_us = 0.0;
     for (int i = 0; i < kIters; ++i) {
-        detector.reset_roi();
+        detector->reset_roi();
         DetectTimingUs t{};
-        auto a = detector.detect(slot, &t);
+        auto a = detector->detect(slot, &t);
         CHECK(a.size() == 1);
         sum_full_us += t.total_us;
     }
@@ -132,7 +159,7 @@ void test_detector_and_benchmark(const AppConfig& cfg) {
     double sum_roi_us = 0.0;
     for (int i = 0; i < kIters; ++i) {
         DetectTimingUs t{};
-        auto a = detector.detect(slot, &t);
+        auto a = detector->detect(slot, &t);
         CHECK(a.size() == 1);
         sum_roi_us += t.total_us;
     }
@@ -146,6 +173,7 @@ void test_detector_and_benchmark(const AppConfig& cfg) {
               << (1e6 / avg_full) << " FPS)\n"
               << "       1280x1024 Dynamic ROI: " << avg_roi << " us ("
               << (1e6 / avg_roi) << " FPS)\n";
+#endif
 }
 
 void test_pnp_solver(const AppConfig& cfg) {

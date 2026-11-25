@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
     }
 
     auto backend = rm_aim::backend::create_compute_backend(weights, true);
-    rm_aim::perception::ArmorDetector detector(cfg.detector, cfg.enemy_color, *backend);
+    auto detector = rm_aim::perception::create_armor_detector(cfg.detector, cfg.enemy_color, *backend);
     rm_aim::perception::PnpSolver pnp_solver(cfg.camera);
 
     rm_aim::estimation::ImuBuffer imu_buffer;
@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[Vernier] 启动完成 | 后端: " << backend->name()
+              << " | 特征: " << detector->name()
               << " | 零拷贝: " << (frame_pool.is_cuda_zero_copy() ? "ON" : "OFF")
               << " | 相机源: " << cfg.camera.source
               << " | 串口: " << cfg.serial.device << "\n";
@@ -118,7 +119,7 @@ int main(int argc, char** argv) {
         }
 
         rm_aim::perception::DetectTimingUs timing{};
-        auto armors = detector.detect(*slot, &timing);
+        auto armors = detector->detect(*slot, &timing);
 
         // 查询与曝光中点对齐的 IMU 姿态（无串口数据时回退为单位四元数）
         rm_aim::ImuSample synced_imu{};
@@ -135,7 +136,7 @@ int main(int argc, char** argv) {
         // 下位机处于手操/空闲模式（mode == 0）时自动复位跟踪器与 ROI，避免重新切入自瞄瞬间拉扯
         if (has_imu && synced_imu.mode == 0U) {
             tracker.reset();
-            detector.reset_roi();
+            detector->reset_roi();
         } else {
             Eigen::Matrix3d R_w2c;
             Eigen::Vector3d t_w2c;

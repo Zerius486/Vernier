@@ -90,7 +90,7 @@ int main(int argc, char** argv) {
     }
 
     auto backend = rm_aim::backend::create_compute_backend(weights, true);
-    rm_aim::perception::ArmorDetector detector(cfg.detector, cfg.enemy_color, *backend);
+    auto detector = rm_aim::perception::create_armor_detector(cfg.detector, cfg.enemy_color, *backend);
     rm_aim::perception::PnpSolver pnp_solver(cfg.camera);
 
     rm_aim::estimation::ImuBuffer imu_buffer;
@@ -115,6 +115,7 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[Vernier-FOLLOW | NO-FIRE] 启动完成 | 后端: " << backend->name()
+              << " | 特征: " << detector->name()
               << " | 前馈: " << (disable_feedforward ? "OFF" : "ON")
               << " | 相机源: " << cfg.camera.source
               << " | 串口: " << cfg.serial.device << "\n";
@@ -135,7 +136,7 @@ int main(int argc, char** argv) {
         }
 
         rm_aim::perception::DetectTimingUs timing{};
-        auto armors = detector.detect(*slot, &timing);
+        auto armors = detector->detect(*slot, &timing);
 
         rm_aim::ImuSample synced_imu{};
         const bool has_imu = imu_buffer.query(slot->timestamp_ns, synced_imu);
@@ -150,7 +151,7 @@ int main(int argc, char** argv) {
 #ifdef RM_AIM_WITH_EIGEN
         if (has_imu && synced_imu.mode == 0U) {
             tracker.reset();
-            detector.reset_roi();
+            detector->reset_roi();
         } else {
             Eigen::Matrix3d R_w2c;
             Eigen::Vector3d t_w2c;

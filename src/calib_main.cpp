@@ -285,7 +285,7 @@ int run_sync_extrinsic_calib(const rm_aim::AppConfig& cfg, double duration_s,
             : rm_aim::backend::MlpWeights::make_dummy(3);
 
     auto backend = rm_aim::backend::create_compute_backend(weights, true);
-    rm_aim::perception::ArmorDetector detector(cfg.detector, cfg.enemy_color, *backend);
+    auto detector = rm_aim::perception::create_armor_detector(cfg.detector, cfg.enemy_color, *backend);
     rm_aim::perception::PnpSolver pnp_solver(cfg.camera);
 
     rm_aim::LatestFramePool pool(3, 4U * 1024U * 1024U);
@@ -324,7 +324,7 @@ int run_sync_extrinsic_calib(const rm_aim::AppConfig& cfg, double duration_s,
             continue;
         }
 
-        auto armors = detector.detect(*slot);
+        auto armors = detector->detect(*slot);
         if (!armors.empty() && pnp_solver.solve(armors[0])) {
             obs_list.push_back(RecordedObs{
                 .ts_ns = slot->timestamp_ns,
@@ -473,7 +473,7 @@ int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
     rm_aim::DetectorConfig det_cfg = cfg.detector;
     det_cfg.use_dynamic_roi = false;
     det_cfg.min_confidence = 0.0f;
-    rm_aim::perception::ArmorDetector detector(det_cfg, cfg.enemy_color, *backend);
+    auto detector = rm_aim::perception::create_armor_detector(det_cfg, cfg.enemy_color, *backend);
 
     std::vector<uint8_t> raw_buf;
     uint64_t frame_idx = 0;
@@ -503,13 +503,18 @@ int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
         slot.frame_id = fhdr.frame_id;
         slot.timestamp_ns = fhdr.timestamp_ns;
 
-        const auto armors = detector.detect(slot);
+        const auto armors = detector->detect(slot);
         cv::Mat raw_gray(static_cast<int>(slot.height), static_cast<int>(slot.width), CV_8UC1,
                          slot.host_ptr, slot.stride);
 
         for (size_t i = 0; i < armors.size(); ++i) {
-            // 与运行期 detector.cpp 完全一致的上下 2x 外扩数字区域裁剪
             const auto& c = armors[i].corners;
+#ifdef RM_AIM_FEATURE_DOTMATRIX
+            // TODO: 待点阵样式确定后，按实际角点定义调整样本裁剪区域；当前暂直接映射四角点
+            const std::vector<cv::Point2f> src_pts = {
+                {c[0].x, c[0].y}, {c[1].x, c[1].y}, {c[2].x, c[2].y}, {c[3].x, c[3].y}};
+#else
+            // 灯条模式下与运行期 lightbar_detector.cpp 完全一致的上下 2x 外扩数字区域裁剪
             const auto expand_pair = [](rm_aim::Point2f top, rm_aim::Point2f bot) {
                 const rm_aim::Point2f mid{0.5f * (top.x + bot.x), 0.5f * (top.y + bot.y)};
                 return std::pair<cv::Point2f, cv::Point2f>{
@@ -518,8 +523,8 @@ int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
             };
             const auto [lt, lb] = expand_pair(c[0], c[3]);
             const auto [rt, rb] = expand_pair(c[1], c[2]);
-
             const std::vector<cv::Point2f> src_pts = {lt, rt, rb, lb};
+#endif
             const std::vector<cv::Point2f> dst_pts = {
                 {0.0f, 0.0f},
                 {static_cast<float>(rm_aim::backend::kMlpInputW - 1U), 0.0f},

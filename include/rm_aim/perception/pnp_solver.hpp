@@ -9,10 +9,18 @@
 
 namespace rm_aim::perception {
 
-/// RoboMaster 标准大小装甲板物理半宽与半高（单位：m）
+#ifdef RM_AIM_FEATURE_DOTMATRIX
+/// 点阵装甲板物理半宽与半高占位常量（单位：m）
+/// TODO: 待官方公布点阵装甲板正式物理尺寸后替换此处占位常量，并保证 2D/3D 角点顺序一致
 inline constexpr double kSmallArmorHalfW = 0.135 * 0.5;
 inline constexpr double kLargeArmorHalfW = 0.230 * 0.5;
 inline constexpr double kArmorHalfH = 0.055 * 0.5;
+#else
+/// RoboMaster 传统灯条大小装甲板物理半宽与半高（单位：m）
+inline constexpr double kSmallArmorHalfW = 0.135 * 0.5;
+inline constexpr double kLargeArmorHalfW = 0.230 * 0.5;
+inline constexpr double kArmorHalfH = 0.055 * 0.5;
+#endif
 
 /// 共面四点 IPPE PnP 求解器（含正深度与最小重投影误差消歧，以及 1D 黄金分割朝向精修）。
 class PnpSolver {

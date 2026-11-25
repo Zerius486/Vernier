@@ -52,6 +52,7 @@ struct DetectorConfig {
     bool use_dynamic_roi = true;
     float roi_scale = 2.5f;
     int full_scan_interval = 15;
+    // TODO: 待点阵装甲板样式公布后，在此补充点阵专属配置项
 };
 
 struct TrackerConfig {
