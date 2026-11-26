@@ -115,9 +115,29 @@ BallisticSolution BallisticSolver::solve(double x, double y, double z,
 
 #ifdef RM_AIM_WITH_EIGEN
 
-Aimer::Aimer(AimerConfig cfg) : cfg_(std::move(cfg)) {}
+Aimer::Aimer(AimerConfig cfg)
+    : cfg_(std::move(cfg)),
+      use_mpc_(cfg_.planner == "mpc"),
+      yaw_mpc_(MpcAxisConfig{
+          .dt = cfg_.mpc_dt,
+          .horizon = cfg_.mpc_horizon,
+          .max_vel = cfg_.mpc_max_yaw_vel,
+          .max_acc = cfg_.mpc_max_yaw_acc,
+          .q_pos = cfg_.mpc_q_pos,
+          .q_vel = cfg_.mpc_q_vel,
+          .r_acc = cfg_.mpc_r_acc,
+      }),
+      pitch_mpc_(MpcAxisConfig{
+          .dt = cfg_.mpc_dt,
+          .horizon = cfg_.mpc_horizon,
+          .max_vel = cfg_.mpc_max_pitch_vel,
+          .max_acc = cfg_.mpc_max_pitch_acc,
+          .q_pos = cfg_.mpc_q_pos,
+          .q_vel = cfg_.mpc_q_vel,
+          .r_acc = cfg_.mpc_r_acc,
+      }) {}
 
-int Aimer::select_armor_id(const VehicleState& state, double center_yaw) const {
+int Aimer::select_armor_id(const VehicleState& state, double center_yaw, int prev_id) const {
     const auto armors = EkfTracker::compute_armors(state);
     if (armors.empty()) return 0;
 
@@ -128,13 +148,13 @@ int Aimer::select_armor_id(const VehicleState& state, double center_yaw) const {
     const double ideal_armor_yaw = wrap_to_pi(center_yaw + std::numbers::pi_v<double>);
 
     // 滞回策略：若上一帧选中的板仍未转出离开角，且转速不是极端情况，优先保持避免抖动切板
-    if (last_armor_id_ >= 0 && last_armor_id_ < static_cast<int>(armors.size())) {
+    if (prev_id >= 0 && prev_id < static_cast<int>(armors.size())) {
         const double rel = shortest_angular_distance(ideal_armor_yaw,
-                                                     armors[static_cast<size_t>(last_armor_id_)].yaw);
+                                                     armors[static_cast<size_t>(prev_id)].yaw);
         const bool moving_out = (state.v_yaw >= 0.0 && rel > leaving_rad) ||
                                 (state.v_yaw < 0.0 && rel < -leaving_rad);
         if (!moving_out && std::fabs(rel) < coming_rad) {
-            return last_armor_id_;
+            return prev_id;
         }
     }
 
@@ -224,7 +244,7 @@ GimbalCmd Aimer::compute_command(const EkfTracker& tracker, const ImuSample& cur
     const double t_coarse = center_sol.fly_time_s + sys_delay;
     const VehicleState pred_coarse = tracker.predict_state(t_coarse);
     const double center_yaw = std::atan2(pred_coarse.yc, pred_coarse.xc);
-    const int chosen_id = select_armor_id(pred_coarse, center_yaw);
+    const int chosen_id = select_armor_id(pred_coarse, center_yaw, last_armor_id_);
 
     last_switched_ = (last_armor_id_ != -1) && (chosen_id != last_armor_id_);
     last_armor_id_ = chosen_id;
@@ -239,17 +259,86 @@ GimbalCmd Aimer::compute_command(const EkfTracker& tracker, const ImuSample& cur
     }
 
     // 第 3 步：叠加机械零位偏置，并对下位机当前 yaw 做最短角展开（避免跨 ±pi 跳变）
-    const double target_yaw_world = sol.yaw_rad + cfg_.yaw_offset_deg * kDegToRad;
-    const double target_pitch_world = sol.pitch_rad + cfg_.pitch_offset_deg * kDegToRad;
+    const double yaw_offset = cfg_.yaw_offset_deg * kDegToRad;
+    const double pitch_offset = cfg_.pitch_offset_deg * kDegToRad;
+    const double target_yaw_world = sol.yaw_rad + yaw_offset;
+    const double target_pitch_world = sol.pitch_rad + pitch_offset;
     const double yaw_err = shortest_angular_distance(current_imu.yaw, target_yaw_world);
     const double pitch_err = target_pitch_world - static_cast<double>(current_imu.pitch);
 
     cmd.yaw = static_cast<float>(static_cast<double>(current_imu.yaw) + yaw_err);
     cmd.pitch = static_cast<float>(target_pitch_world);
 
-    // 第 4 步：在 t_hit 附近做 1ms 中心差分计算速度/加速度前馈；
-    // 切板瞬间将前馈置零，防止角度阶跃产生巨大加速度脉冲打抽云台
-    if (!last_switched_) {
+    // 第 4 步：Planning 轨迹规划与前馈生成（支持 "mpc" 轻量线性轨迹规划 与 "direct" 中心差分）
+    if (use_mpc_) {
+        const int N = yaw_mpc_.horizon();
+        const double dt = yaw_mpc_.dt();
+        std::array<double, MpcAxisPlanner::kMaxHorizon + 1> ref_yaw{};
+        std::array<double, MpcAxisPlanner::kMaxHorizon + 1> ref_yaw_vel{};
+        std::array<double, MpcAxisPlanner::kMaxHorizon + 1> ref_pitch{};
+        std::array<double, MpcAxisPlanner::kMaxHorizon + 1> ref_pitch_vel{};
+        std::array<int, MpcAxisPlanner::kMaxHorizon + 1> ref_ids{};
+
+        ref_yaw[0] = static_cast<double>(current_imu.yaw) + yaw_err;
+        ref_pitch[0] = target_pitch_world;
+        ref_ids[0] = chosen_id;
+
+        int sim_id = chosen_id;
+        for (int k = 1; k <= N; ++k) {
+            const double tk = t_hit + static_cast<double>(k) * dt;
+            const VehicleState pk = tracker.predict_state(tk);
+            const double c_yaw_k = std::atan2(pk.yc, pk.xc);
+            sim_id = select_armor_id(pk, c_yaw_k, sim_id);
+            ref_ids[static_cast<size_t>(k)] = sim_id;
+
+            const auto armors_k = EkfTracker::compute_armors(pk);
+            const auto& ak = armors_k[static_cast<size_t>(sim_id % static_cast<int>(armors_k.size()))];
+            const BallisticSolution sol_k = ballistic_.solve(ak.x, ak.y, ak.z, bullet_speed);
+            if (sol_k.valid) {
+                const double y_raw = sol_k.yaw_rad + yaw_offset;
+                const double p_raw = sol_k.pitch_rad + pitch_offset;
+                const double prev_y = ref_yaw[static_cast<size_t>(k - 1)];
+                ref_yaw[static_cast<size_t>(k)] =
+                    prev_y + shortest_angular_distance(prev_y, y_raw);
+                ref_pitch[static_cast<size_t>(k)] = p_raw;
+            } else {
+                ref_yaw[static_cast<size_t>(k)] = ref_yaw[static_cast<size_t>(k - 1)];
+                ref_pitch[static_cast<size_t>(k)] = ref_pitch[static_cast<size_t>(k - 1)];
+            }
+        }
+
+        // 计算参考角速度序列；在切板跃变步处将参考角速度置零，避免引入虚假冲激速度
+        for (int k = 0; k < N; ++k) {
+            const size_t ks = static_cast<size_t>(k);
+            if (ref_ids[ks + 1] == ref_ids[ks]) {
+                ref_yaw_vel[ks] = std::clamp((ref_yaw[ks + 1] - ref_yaw[ks]) / dt,
+                                             -cfg_.mpc_max_yaw_vel, cfg_.mpc_max_yaw_vel);
+                ref_pitch_vel[ks] = std::clamp((ref_pitch[ks + 1] - ref_pitch[ks]) / dt,
+                                               -cfg_.mpc_max_pitch_vel, cfg_.mpc_max_pitch_vel);
+            } else {
+                ref_yaw_vel[ks] = 0.0;
+                ref_pitch_vel[ks] = 0.0;
+            }
+        }
+        ref_yaw_vel[static_cast<size_t>(N)] = ref_yaw_vel[static_cast<size_t>(N - 1)];
+        ref_pitch_vel[static_cast<size_t>(N)] = ref_pitch_vel[static_cast<size_t>(N - 1)];
+
+        const MpcPlanOutput py =
+            yaw_mpc_.solve(static_cast<double>(current_imu.yaw),
+                           static_cast<double>(current_imu.yaw_vel), ref_yaw.data(),
+                           ref_yaw_vel.data(), N + 1);
+        const MpcPlanOutput pp =
+            pitch_mpc_.solve(static_cast<double>(current_imu.pitch),
+                             static_cast<double>(current_imu.pitch_vel), ref_pitch.data(),
+                             ref_pitch_vel.data(), N + 1);
+
+        cmd.yaw = static_cast<float>(py.pos);
+        cmd.yaw_vel = static_cast<float>(py.vel);
+        cmd.yaw_acc = static_cast<float>(py.acc);
+        cmd.pitch = static_cast<float>(pp.pos);
+        cmd.pitch_vel = static_cast<float>(pp.vel);
+        cmd.pitch_acc = static_cast<float>(pp.acc);
+    } else if (!last_switched_) {
         constexpr double h = 0.002;  // 2 ms 中心差分步长
         const BallisticSolution sol_m = solve_for_armor_at(tracker, chosen_id, t_hit - h, bullet_speed);
         const BallisticSolution sol_p = solve_for_armor_at(tracker, chosen_id, t_hit + h, bullet_speed);

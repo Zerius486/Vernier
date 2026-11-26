@@ -35,9 +35,9 @@ std::atomic<bool> g_stop{false};
 void handle_signal(int) { g_stop.store(true, std::memory_order_release); }
 
 void print_usage(const char* prog) {
-    std::cout << "用法: " << prog << " [config.yaml] [--no-ff] [--mjpeg]\n"
+    std::cout << "用法: " << prog << " <config.yaml> [--no-ff] [--mjpeg]\n"
               << "  说明   : 纯瞄准跟随测试程序，代码级强制禁火（mode 最高为 1，fire_rate_hz 恒为 0）\n"
-              << "  --no-ff: 关闭速度/加速度前馈，仅输出目标位置角度（便于单独排查外参与位置环）\n"
+              << "  --no-ff: 关闭速度/加速度前馈，仅输出目标位置角度\n"
               << "  --mjpeg: 临时强制开启 MJPEG 网页调试推流\n";
 }
 
@@ -47,7 +47,7 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    std::string cfg_path = "config/default.yaml";
+    std::string cfg_path;
     bool disable_feedforward = false;
     bool force_mjpeg = false;
 
@@ -63,6 +63,12 @@ int main(int argc, char** argv) {
         } else {
             cfg_path = arg;
         }
+    }
+
+    if (cfg_path.empty()) {
+        std::cerr << "[Vernier-FOLLOW] 错误：请显式指定配置文件路径。\n";
+        print_usage(argv[0]);
+        return 1;
     }
 
     rm_aim::AppConfig cfg;
@@ -121,6 +127,11 @@ int main(int argc, char** argv) {
               << " | 串口: " << cfg.serial.device << "\n";
 
     serial->start([&](const rm_aim::ImuSample& sample) { imu_buffer.push(sample); });
+    if (auto* replay_cam = dynamic_cast<rm_aim::hal::ReplayCameraSource*>(camera.get())) {
+        replay_cam->set_imu_callback([&](const rm_aim::ImuSample& sample) {
+            imu_buffer.push(sample);
+        });
+    }
     camera->start(frame_pool);
 
     uint64_t proc_frames = 0;

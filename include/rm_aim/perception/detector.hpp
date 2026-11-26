@@ -18,9 +18,9 @@ struct DetectTimingUs {
     bool used_roi = false;
 };
 
-/// 装甲板检测器抽象接口（编译期通过 RM_AIM_FEATURE_TYPE 唯一绑定具体实现）：
-///   - LIGHTBAR  -> LightbarDetector（传统灯条 PCA + 梯度亚像素 + MLP）
-///   - DOTMATRIX -> DotMatrixDetector（点阵留空占位接口，待样式公布后实现）
+/// 装甲板检测器抽象接口，编译期通过 RM_AIM_FEATURE_TYPE 绑定实现：
+///   - LIGHTBAR  -> LightbarDetector
+///   - DOTMATRIX -> DotMatrixDetector
 class IArmorDetector {
 public:
     virtual ~IArmorDetector() = default;

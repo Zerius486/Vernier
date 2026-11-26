@@ -8,7 +8,7 @@
 namespace rm_aim::hal {
 
 // ---------------------------------------------------------------------------
-// RawFrameWriter
+// RawFrameWriter（RMRAW002 异步后台写盘：图像帧 + IMU 同步交错写入）
 // ---------------------------------------------------------------------------
 RawFrameWriter::~RawFrameWriter() { close(); }
 
@@ -24,38 +24,222 @@ bool RawFrameWriter::open(const std::string& path) {
     if (!file_.is_open()) return false;
 
     RawFileHeader hdr{};
-    std::memcpy(hdr.magic, "RMRAW001", 8);
-    hdr.version = 1;
+    std::memcpy(hdr.magic, "RMRAW002", 8);
+    hdr.version = 2;
     hdr.reserved = 0;
     file_.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
-    return file_.good();
-}
-
-bool RawFrameWriter::write(const FrameSlot& slot) {
-    if (!file_.is_open() || slot.host_ptr == nullptr || slot.byte_size == 0) {
+    if (!file_.good()) {
+        file_.close();
         return false;
     }
 
-    RawFrameHeader fhdr{};
-    fhdr.frame_id = slot.frame_id;
-    fhdr.timestamp_ns = slot.timestamp_ns;
-    fhdr.width = slot.width;
-    fhdr.height = slot.height;
-    fhdr.stride = slot.stride;
-    fhdr.byte_size = slot.byte_size;
-    fhdr.format = static_cast<uint8_t>(slot.format);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        queue_.clear();
+        queued_frames_ = 0;
+        stop_ = false;
+        open_ = true;
+        dropped_frames_.store(0, std::memory_order_relaxed);
+    }
+    writer_thread_ = std::thread(&RawFrameWriter::writer_loop, this);
+    return true;
+}
 
-    file_.write(reinterpret_cast<const char*>(&fhdr), sizeof(fhdr));
-    file_.write(reinterpret_cast<const char*>(slot.host_ptr),
-                static_cast<std::streamsize>(slot.byte_size));
-    return file_.good();
+bool RawFrameWriter::write(const FrameSlot& slot) {
+    if (slot.host_ptr == nullptr || slot.byte_size == 0) {
+        return false;
+    }
+
+    constexpr size_t kMaxQueuedFrames = 32;
+    PendingChunk chunk{};
+    chunk.type = RawChunkType::Frame;
+    chunk.fhdr.frame_id = slot.frame_id;
+    chunk.fhdr.timestamp_ns = slot.timestamp_ns;
+    chunk.fhdr.width = slot.width;
+    chunk.fhdr.height = slot.height;
+    chunk.fhdr.stride = slot.stride;
+    chunk.fhdr.byte_size = slot.byte_size;
+    chunk.fhdr.format = static_cast<uint8_t>(slot.format);
+    chunk.pixels.assign(slot.host_ptr, slot.host_ptr + slot.byte_size);
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!open_) return false;
+        // 磁盘写入跟不上时丢弃新帧，防止内存暴涨或阻塞实时视觉主循环
+        if (queued_frames_ >= kMaxQueuedFrames) {
+            dropped_frames_.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        queue_.push_back(std::move(chunk));
+        ++queued_frames_;
+    }
+    cv_.notify_one();
+    return true;
+}
+
+bool RawFrameWriter::write_imu(const ImuSample& sample) {
+    constexpr size_t kMaxTotalChunks = 4096;
+    PendingChunk chunk{};
+    chunk.type = RawChunkType::Imu;
+    chunk.imu = sample;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!open_ || queue_.size() >= kMaxTotalChunks) return false;
+        queue_.push_back(std::move(chunk));
+    }
+    cv_.notify_one();
+    return true;
+}
+
+void RawFrameWriter::writer_loop() {
+    while (true) {
+        PendingChunk chunk{};
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            cv_.wait(lock, [&] { return stop_ || !queue_.empty(); });
+            if (queue_.empty()) {
+                if (stop_) break;
+                continue;
+            }
+            chunk = std::move(queue_.front());
+            queue_.pop_front();
+            if (chunk.type == RawChunkType::Frame && queued_frames_ > 0) {
+                --queued_frames_;
+            }
+        }
+
+        if (!file_.is_open()) continue;
+        if (chunk.type == RawChunkType::Frame) {
+            RawChunkHeader chdr{};
+            chdr.type = static_cast<uint8_t>(RawChunkType::Frame);
+            chdr.payload_size =
+                static_cast<uint32_t>(sizeof(RawFrameHeader) + chunk.pixels.size());
+            file_.write(reinterpret_cast<const char*>(&chdr), sizeof(chdr));
+            file_.write(reinterpret_cast<const char*>(&chunk.fhdr), sizeof(chunk.fhdr));
+            file_.write(reinterpret_cast<const char*>(chunk.pixels.data()),
+                        static_cast<std::streamsize>(chunk.pixels.size()));
+        } else if (chunk.type == RawChunkType::Imu) {
+            RawChunkHeader chdr{};
+            chdr.type = static_cast<uint8_t>(RawChunkType::Imu);
+            chdr.payload_size = static_cast<uint32_t>(sizeof(ImuSample));
+            file_.write(reinterpret_cast<const char*>(&chdr), sizeof(chdr));
+            file_.write(reinterpret_cast<const char*>(&chunk.imu), sizeof(chunk.imu));
+        }
+    }
 }
 
 void RawFrameWriter::close() {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!open_ && !writer_thread_.joinable()) {
+            if (file_.is_open()) {
+                file_.flush();
+                file_.close();
+            }
+            return;
+        }
+        open_ = false;
+        stop_ = true;
+    }
+    cv_.notify_all();
+    if (writer_thread_.joinable()) {
+        writer_thread_.join();
+    }
     if (file_.is_open()) {
         file_.flush();
         file_.close();
     }
+}
+
+// ---------------------------------------------------------------------------
+// RawLogReader（顺序读取 RMRAW001 / RMRAW002）
+// ---------------------------------------------------------------------------
+bool RawLogReader::open(const std::string& path) {
+    close();
+    file_.open(path, std::ios::binary);
+    if (!file_.is_open()) return false;
+
+    RawFileHeader hdr{};
+    file_.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
+    if (!file_.good()) {
+        close();
+        return false;
+    }
+
+    if (std::memcmp(hdr.magic, "RMRAW001", 8) == 0) {
+        version_ = 1;
+        return true;
+    }
+    if (std::memcmp(hdr.magic, "RMRAW002", 8) == 0) {
+        version_ = 2;
+        return true;
+    }
+
+    close();
+    return false;
+}
+
+bool RawLogReader::read_next(RawChunkType& out_type, RawFrameHeader& out_fhdr,
+                             std::vector<uint8_t>& out_pixels, ImuSample& out_imu) {
+    if (!file_.is_open()) return false;
+
+    if (version_ == 1) {
+        file_.read(reinterpret_cast<char*>(&out_fhdr), sizeof(out_fhdr));
+        if (!file_.good()) return false;
+        out_pixels.resize(out_fhdr.byte_size);
+        file_.read(reinterpret_cast<char*>(out_pixels.data()),
+                   static_cast<std::streamsize>(out_fhdr.byte_size));
+        if (!file_.good()) return false;
+        out_type = RawChunkType::Frame;
+        return true;
+    }
+
+    while (true) {
+        RawChunkHeader chdr{};
+        file_.read(reinterpret_cast<char*>(&chdr), sizeof(chdr));
+        if (!file_.good()) return false;
+
+        if (chdr.type == static_cast<uint8_t>(RawChunkType::Frame)) {
+            if (chdr.payload_size < sizeof(RawFrameHeader)) return false;
+            file_.read(reinterpret_cast<char*>(&out_fhdr), sizeof(out_fhdr));
+            if (!file_.good()) return false;
+            const uint32_t expected_bytes = chdr.payload_size - static_cast<uint32_t>(sizeof(RawFrameHeader));
+            if (out_fhdr.byte_size != expected_bytes) return false;
+            out_pixels.resize(out_fhdr.byte_size);
+            file_.read(reinterpret_cast<char*>(out_pixels.data()),
+                       static_cast<std::streamsize>(out_fhdr.byte_size));
+            if (!file_.good()) return false;
+            out_type = RawChunkType::Frame;
+            return true;
+        }
+
+        if (chdr.type == static_cast<uint8_t>(RawChunkType::Imu)) {
+            if (chdr.payload_size != sizeof(ImuSample)) return false;
+            file_.read(reinterpret_cast<char*>(&out_imu), sizeof(out_imu));
+            if (!file_.good()) return false;
+            out_type = RawChunkType::Imu;
+            return true;
+        }
+
+        // 跳过未来版本新增的未知扩展块，保证前向兼容
+        file_.seekg(static_cast<std::streamoff>(chdr.payload_size), std::ios::cur);
+        if (!file_.good()) return false;
+    }
+}
+
+bool RawLogReader::rewind() {
+    if (!file_.is_open()) return false;
+    file_.clear();
+    file_.seekg(sizeof(RawFileHeader), std::ios::beg);
+    return file_.good();
+}
+
+void RawLogReader::close() {
+    if (file_.is_open()) {
+        file_.close();
+    }
+    version_ = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +249,10 @@ ReplayCameraSource::ReplayCameraSource(std::string path, double target_fps, bool
     : path_(std::move(path)), target_fps_(target_fps), loop_(loop) {}
 
 ReplayCameraSource::~ReplayCameraSource() { stop(); }
+
+void ReplayCameraSource::set_imu_callback(std::function<void(const ImuSample&)> cb) {
+    imu_cb_ = std::move(cb);
+}
 
 bool ReplayCameraSource::start(LatestFramePool& pool) {
     if (running_.exchange(true)) return true;
@@ -79,15 +267,8 @@ void ReplayCameraSource::stop() {
 }
 
 void ReplayCameraSource::worker(LatestFramePool* pool) {
-    std::ifstream file(path_, std::ios::binary);
-    if (!file.is_open()) {
-        errors_.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-
-    RawFileHeader hdr{};
-    file.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (!file.good() || std::memcmp(hdr.magic, "RMRAW001", 8) != 0) {
+    RawLogReader reader;
+    if (!reader.open(path_)) {
         errors_.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -98,32 +279,34 @@ void ReplayCameraSource::worker(LatestFramePool* pool) {
             ? std::chrono::nanoseconds(static_cast<int64_t>(1e9 / target_fps_))
             : std::chrono::nanoseconds(0);
 
+    std::vector<uint8_t> pixels;
+    RawFrameHeader fhdr{};
+    ImuSample imu{};
+    RawChunkType type = RawChunkType::Frame;
+
     while (running_.load(std::memory_order_acquire)) {
         const auto t0 = Clock::now();
-        RawFrameHeader fhdr{};
-        file.read(reinterpret_cast<char*>(&fhdr), sizeof(fhdr));
-        if (!file.good()) {
-            if (loop_) {
-                file.clear();
-                file.seekg(sizeof(RawFileHeader), std::ios::beg);
+        if (!reader.read_next(type, fhdr, pixels, imu)) {
+            if (loop_ && reader.rewind()) {
                 continue;
             }
             break;
         }
 
-        FrameSlot& slot = pool->acquire_write_slot();
-        if (fhdr.byte_size > slot.capacity) {
-            errors_.fetch_add(1, std::memory_order_relaxed);
-            file.seekg(fhdr.byte_size, std::ios::cur);
+        if (type == RawChunkType::Imu) {
+            if (imu_cb_) {
+                imu_cb_(imu);
+            }
             continue;
         }
 
-        file.read(reinterpret_cast<char*>(slot.host_ptr),
-                  static_cast<std::streamsize>(fhdr.byte_size));
-        if (!file.good()) {
-            break;
+        FrameSlot& slot = pool->acquire_write_slot();
+        if (fhdr.byte_size > slot.capacity) {
+            errors_.fetch_add(1, std::memory_order_relaxed);
+            continue;
         }
 
+        std::memcpy(slot.host_ptr, pixels.data(), fhdr.byte_size);
         slot.frame_id = fhdr.frame_id;
         slot.timestamp_ns = fhdr.timestamp_ns;
         slot.width = fhdr.width;

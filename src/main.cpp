@@ -40,7 +40,13 @@ int main(int argc, char** argv) {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
 
-    const std::string cfg_path = (argc > 1) ? argv[1] : "config/default.yaml";
+    if (argc < 2 || std::string(argv[1]) == "-h" || std::string(argv[1]) == "--help") {
+        std::cout << "用法: " << argv[0] << " <config.yaml>\n"
+                  << "  请显式传入当前兵种已完成标定的配置文件路径（参考模板 config/example.yaml）\n";
+        return (argc < 2) ? 1 : 0;
+    }
+
+    const std::string cfg_path = argv[1];
     rm_aim::AppConfig cfg;
     try {
         cfg = rm_aim::AppConfig::load(cfg_path);
@@ -69,12 +75,12 @@ int main(int argc, char** argv) {
     rm_aim::estimation::Aimer aimer(cfg.aimer);
 #endif
 
-    // 预分配 3 槽零拷贝帧池（最大覆盖 1440x1080 单通道 Bayer 约 1.6MB，预留 4MB）
+    // 预分配 3 槽零拷贝帧池
     rm_aim::LatestFramePool frame_pool(3, 4U * 1024U * 1024U);
     auto camera = rm_aim::hal::create_camera_source(cfg.camera, cfg.enemy_color);
     auto serial = rm_aim::hal::create_serial_link(cfg.serial);
 
-    // 可选无头调试组件（未开启时零开销）
+    // 可选无头调试组件
     rm_aim::debug::MjpegServer mjpeg(cfg.debug.mjpeg_port);
     if (cfg.debug.enable_mjpeg) {
         if (mjpeg.start()) {
@@ -99,7 +105,17 @@ int main(int argc, char** argv) {
               << " | 相机源: " << cfg.camera.source
               << " | 串口: " << cfg.serial.device << "\n";
 
-    serial->start([&](const rm_aim::ImuSample& sample) { imu_buffer.push(sample); });
+    serial->start([&](const rm_aim::ImuSample& sample) {
+        imu_buffer.push(sample);
+        if (cfg.debug.enable_record) {
+            recorder.write_imu(sample);
+        }
+    });
+    if (auto* replay_cam = dynamic_cast<rm_aim::hal::ReplayCameraSource*>(camera.get())) {
+        replay_cam->set_imu_callback([&](const rm_aim::ImuSample& sample) {
+            imu_buffer.push(sample);
+        });
+    }
     camera->start(frame_pool);
 
     uint64_t proc_frames = 0;
@@ -121,7 +137,7 @@ int main(int argc, char** argv) {
         rm_aim::perception::DetectTimingUs timing{};
         auto armors = detector->detect(*slot, &timing);
 
-        // 查询与曝光中点对齐的 IMU 姿态（无串口数据时回退为单位四元数）
+        // 查询与曝光中点对齐的 IMU 姿态
         rm_aim::ImuSample synced_imu{};
         const bool has_imu = imu_buffer.query(slot->timestamp_ns, synced_imu);
         if (!has_imu) {

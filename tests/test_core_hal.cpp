@@ -1,3 +1,4 @@
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -199,9 +200,9 @@ void test_loopback_serial() {
 }
 
 void test_synthetic_record_and_replay() {
-    std::cout << "[TEST] Synthetic BayerRG8 -> RawRecorder -> ReplayCameraSource... ";
+    std::cout << "[TEST] Synthetic BayerRG8 + IMU -> RMRAW002 -> ReplayCameraSource... ";
 
-    const auto tmp_file = std::filesystem::temp_directory_path() / "rm_aim_phase1_test.rmraw";
+    const auto tmp_file = std::filesystem::temp_directory_path() / "rm_aim_core_hal_test.rmraw";
 
     LatestFramePool pool(3, 320 * 240);
     SyntheticCameraSource synth(320, 240, 0.0, EnemyColor::Blue);
@@ -215,7 +216,16 @@ void test_synthetic_record_and_replay() {
         if (slot != nullptr) {
             CHECK(slot->format == PixelFormat::BayerRG8);
             CHECK(slot->width == 320 && slot->height == 240);
+
+            // 同步写入对应时间戳的 IMU 样本，验证 RMRAW002 交错录包与回放
+            ImuSample imu{};
+            imu.timestamp_ns = slot->timestamp_ns;
+            imu.mode = 1;
+            imu.yaw = 0.1f * static_cast<float>(recorded);
+            imu.bullet_speed = 24.5f;
+            CHECK(writer.write_imu(imu));
             CHECK(writer.write(*slot));
+
             pool.release_read_slot();
             ++recorded;
         } else {
@@ -225,9 +235,34 @@ void test_synthetic_record_and_replay() {
     synth.stop();
     writer.close();
 
+    // 验证顺序读取器正确识别 RMRAW002 并还原全部帧与 IMU 块
+    {
+        RawLogReader reader;
+        CHECK(reader.open(tmp_file.string()));
+        CHECK(reader.version() == 2);
+        RawChunkType type = RawChunkType::Frame;
+        RawFrameHeader fhdr{};
+        std::vector<uint8_t> pixels;
+        ImuSample imu{};
+        int f_cnt = 0;
+        int imu_cnt = 0;
+        while (reader.read_next(type, fhdr, pixels, imu)) {
+            if (type == RawChunkType::Frame) ++f_cnt;
+            if (type == RawChunkType::Imu) ++imu_cnt;
+        }
+        CHECK(f_cnt == 5);
+        CHECK(imu_cnt == 5);
+    }
+
     // 从 .rmraw 离线回放（略微限速以确保消费端稳定取帧）
     LatestFramePool replay_pool(3, 320 * 240);
     ReplayCameraSource replay(tmp_file.string(), 500.0, false);
+    std::atomic<int> replayed_imu{0};
+    replay.set_imu_callback([&](const ImuSample& s) {
+        if (std::fabs(s.bullet_speed - 24.5f) < 1e-4f) {
+            replayed_imu.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
     CHECK(replay.start(replay_pool));
 
     int replayed = 0;
@@ -246,19 +281,20 @@ void test_synthetic_record_and_replay() {
     replay.stop();
     std::filesystem::remove(tmp_file);
     CHECK(replayed >= 1);
+    CHECK(replayed_imu.load(std::memory_order_relaxed) == 5);
 
-    std::cout << "OK (" << replayed << " frames replayed)\n";
+    std::cout << "OK (" << replayed << " frames, " << replayed_imu.load() << " IMU replayed)\n";
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string cfg_path = (argc > 1) ? argv[1] : "config/default.yaml";
+    const std::string cfg_path = (argc > 1) ? argv[1] : "config/example.yaml";
     test_protocol_and_crc();
     test_spsc_and_frame_pool();
     test_config_loader(cfg_path);
     test_loopback_serial();
     test_synthetic_record_and_replay();
-    std::cout << "All Phase 1 tests passed!\n";
+    std::cout << "All core_hal tests passed!\n";
     return 0;
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 一键配置海康工业 USB3 相机（VID 2bdf）与 UART/USB-CDC 串口设备权限
+# 一键配置海康工业 USB3 相机与 UART/USB-CDC 串口设备权限
 RULE_FILE="/etc/udev/rules.d/99-rm-auto-aim.rules"
 
 echo "正在写入 udev 规则到 ${RULE_FILE}（需要 sudo 权限）..."

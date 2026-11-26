@@ -9,7 +9,7 @@
 namespace rm_aim {
 
 struct CameraConfig {
-    std::string source = "hik";  // 数据源："hik"（海康）、"replay"（录包回放）、"synthetic"（合成流）
+    std::string source = "hik";  // 数据源："hik" / "replay" / "synthetic"
     std::string replay_path;
     double exposure_us = 2000.0;
     double gain = 16.0;
@@ -76,6 +76,17 @@ struct AimerConfig {
     uint8_t max_fire_rate_hz = 20;    // 近距离正对最大建议射频（Hz）
     uint8_t min_fire_rate_hz = 6;     // 远距离/高速切板保精度最小射频（Hz）
     double bullet_speed_alpha = 0.3;  // 发弹后实时弹速一阶滤波系数
+    // 轨迹规划器："direct" 或 "mpc"
+    std::string planner = "direct";
+    double mpc_dt = 0.01;
+    int mpc_horizon = 25;
+    double mpc_max_yaw_vel = 12.0;
+    double mpc_max_yaw_acc = 60.0;
+    double mpc_max_pitch_vel = 8.0;
+    double mpc_max_pitch_acc = 40.0;
+    double mpc_q_pos = 200.0;
+    double mpc_q_vel = 2.0;
+    double mpc_r_acc = 0.01;
 };
 
 struct DebugConfig {
@@ -99,7 +110,7 @@ struct AppConfig {
     AimerConfig aimer;
     DebugConfig debug;
 
-    /// 零外部依赖的轻量 YAML 子集解析器（支持两级分组、标量、字符串与内联数组）。
+    /// 零外部依赖的轻量 YAML 子集解析器。
     static AppConfig load(const std::string& path);
 };
 

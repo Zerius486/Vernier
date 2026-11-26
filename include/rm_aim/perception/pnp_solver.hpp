@@ -22,7 +22,7 @@ inline constexpr double kLargeArmorHalfW = 0.230 * 0.5;
 inline constexpr double kArmorHalfH = 0.055 * 0.5;
 #endif
 
-/// 共面四点 IPPE PnP 求解器（含正深度与最小重投影误差消歧，以及 1D 黄金分割朝向精修）。
+/// 共面四点 IPPE PnP 求解器。
 class PnpSolver {
 public:
     explicit PnpSolver(const CameraConfig& cam_cfg);

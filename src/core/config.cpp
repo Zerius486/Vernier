@@ -219,6 +219,16 @@ AppConfig AppConfig::load(const std::string& path) {
         cfg.aimer.min_fire_rate_hz = static_cast<uint8_t>(std::stoul(it->second));
     }
     get_dbl("aimer.bullet_speed_alpha", cfg.aimer.bullet_speed_alpha);
+    get_str("aimer.planner", cfg.aimer.planner);
+    get_dbl("aimer.mpc_dt", cfg.aimer.mpc_dt);
+    get_int("aimer.mpc_horizon", cfg.aimer.mpc_horizon);
+    get_dbl("aimer.mpc_max_yaw_vel", cfg.aimer.mpc_max_yaw_vel);
+    get_dbl("aimer.mpc_max_yaw_acc", cfg.aimer.mpc_max_yaw_acc);
+    get_dbl("aimer.mpc_max_pitch_vel", cfg.aimer.mpc_max_pitch_vel);
+    get_dbl("aimer.mpc_max_pitch_acc", cfg.aimer.mpc_max_pitch_acc);
+    get_dbl("aimer.mpc_q_pos", cfg.aimer.mpc_q_pos);
+    get_dbl("aimer.mpc_q_vel", cfg.aimer.mpc_q_vel);
+    get_dbl("aimer.mpc_r_acc", cfg.aimer.mpc_r_acc);
 
     // 调试与可视化参数
     get_bool("debug.enable_tui", cfg.debug.enable_tui);

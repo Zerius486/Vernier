@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(vernier VERSION 0.2.0 LANGUAGES CXX)
+project(vernier VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -19,7 +19,7 @@ set_property(CACHE RM_AIM_FEATURE_TYPE PROPERTY STRINGS LIGHTBAR DOTMATRIX)
 
 option(RM_AIM_ENABLE_NATIVE_OPT "在 Release 构建中启用 -march=native / SIMD 指令优化" ON)
 option(RM_AIM_BUILD_TESTS "构建单元测试与性能基准" ON)
-option(RM_AIM_BUILD_CALIB "构建 SSH 无头标定与校准工具 vernier_calib（可选）" OFF)
+option(RM_AIM_BUILD_CALIB "构建 SSH 无头标定与校准工具 vernier_calib" OFF)
 
 # ---------------------------------------------------------------------------
 # 架构检测与编译器标志
@@ -45,14 +45,14 @@ if(RM_AIM_ENABLE_NATIVE_OPT)
 endif()
 
 # ---------------------------------------------------------------------------
-# 可选依赖探测（无硬件/无第三方推理框架也可直接离线编译）
+# 可选依赖探测
 # ---------------------------------------------------------------------------
 find_package(Threads REQUIRED)
 find_package(MVS QUIET)
 find_package(OpenCV QUIET COMPONENTS core imgproc calib3d imgcodecs videoio)
 find_package(Eigen3 QUIET)
 
-# CUDA 探测（Jetson Xavier NX: sm_72，Orin NX: sm_87）
+# CUDA 探测
 set(RM_AIM_WITH_CUDA OFF)
 if(ENABLE_CUDA STREQUAL "ON")
     enable_language(CUDA)
@@ -96,7 +96,7 @@ message(STATUS "Eigen3 found:      ${Eigen3_FOUND}")
 message(STATUS "Armor feature:     ${RM_AIM_FEATURE_TYPE}")
 
 # ---------------------------------------------------------------------------
-# 核心库：Core + HAL + Backend + Perception + Estimation + Debug（Phase 1~4）
+# 核心库：Core + HAL + Backend + Perception + Estimation + Debug
 # ---------------------------------------------------------------------------
 set(RM_AIM_CORE_SOURCES
     src/core/config.cpp
@@ -107,6 +107,7 @@ set(RM_AIM_CORE_SOURCES
     src/perception/pnp_solver.cpp
     src/estimation/imu_buffer.cpp
     src/estimation/ekf_tracker.cpp
+    src/estimation/mpc_planner.cpp
     src/estimation/ballistic.cpp
     src/debug/mjpeg_server.cpp
     src/debug/udp_telemetry.cpp
@@ -159,7 +160,7 @@ if(Eigen3_FOUND)
 endif()
 
 # ---------------------------------------------------------------------------
-# 主程序可执行文件：vernier（完整火控）与 vernier_follow（纯瞄准跟随测试，强制禁火）
+# 主程序可执行文件
 # ---------------------------------------------------------------------------
 add_executable(vernier src/main.cpp)
 target_link_libraries(vernier PRIVATE rm_aim_core)
@@ -168,7 +169,7 @@ add_executable(vernier_follow src/follow_main.cpp)
 target_link_libraries(vernier_follow PRIVATE rm_aim_core)
 
 # ---------------------------------------------------------------------------
-# 可选标定工具：vernier_calib（需 -DRM_AIM_BUILD_CALIB=ON 且具备 OpenCV + Eigen3）
+# 可选标定工具
 # ---------------------------------------------------------------------------
 if(RM_AIM_BUILD_CALIB)
     if(OpenCV_FOUND AND Eigen3_FOUND)
@@ -187,15 +188,15 @@ if(RM_AIM_BUILD_TESTS)
     include(CTest)
     enable_testing()
 
-    add_executable(test_phase1 tests/test_phase1.cpp)
-    target_link_libraries(test_phase1 PRIVATE rm_aim_core)
-    add_test(NAME phase1_core_hal COMMAND test_phase1 "${CMAKE_CURRENT_SOURCE_DIR}/config/default.yaml")
+    add_executable(test_core_hal tests/test_core_hal.cpp)
+    target_link_libraries(test_core_hal PRIVATE rm_aim_core)
+    add_test(NAME core_hal COMMAND test_core_hal "${CMAKE_CURRENT_SOURCE_DIR}/config/example.yaml")
 
-    add_executable(test_phase2 tests/test_phase2.cpp)
-    target_link_libraries(test_phase2 PRIVATE rm_aim_core)
-    add_test(NAME phase2_backend_perception COMMAND test_phase2 "${CMAKE_CURRENT_SOURCE_DIR}/config/default.yaml")
+    add_executable(test_perception tests/test_perception.cpp)
+    target_link_libraries(test_perception PRIVATE rm_aim_core)
+    add_test(NAME perception COMMAND test_perception "${CMAKE_CURRENT_SOURCE_DIR}/config/example.yaml")
 
-    add_executable(test_phase3 tests/test_phase3.cpp)
-    target_link_libraries(test_phase3 PRIVATE rm_aim_core)
-    add_test(NAME phase3_estimation_ballistic COMMAND test_phase3 "${CMAKE_CURRENT_SOURCE_DIR}/config/default.yaml")
+    add_executable(test_estimation tests/test_estimation.cpp)
+    target_link_libraries(test_estimation PRIVATE rm_aim_core)
+    add_test(NAME estimation COMMAND test_estimation "${CMAKE_CURRENT_SOURCE_DIR}/config/example.yaml")
 endif()

@@ -283,7 +283,7 @@ void test_cpu_vs_cuda_equivalence(const AppConfig& cfg) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string cfg_path = (argc > 1) ? argv[1] : "config/default.yaml";
+    const std::string cfg_path = (argc > 1) ? argv[1] : "config/example.yaml";
     const AppConfig cfg = AppConfig::load(cfg_path);
 
     test_mlp_weights_io();
@@ -291,6 +291,6 @@ int main(int argc, char** argv) {
     test_pnp_solver(cfg);
     test_cpu_vs_cuda_equivalence(cfg);
 
-    std::cout << "All Phase 2 tests passed!\n";
+    std::cout << "All perception tests passed!\n";
     return 0;
 }

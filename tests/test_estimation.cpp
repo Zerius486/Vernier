@@ -1,3 +1,5 @@
+#include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +14,7 @@
 #include "rm_aim/estimation/ekf_tracker.hpp"
 #include "rm_aim/estimation/imu_buffer.hpp"
 #include "rm_aim/estimation/motion_model.hpp"
+#include "rm_aim/estimation/mpc_planner.hpp"
 #include "rm_aim/perception/pnp_solver.hpp"
 
 using namespace rm_aim;
@@ -286,17 +289,112 @@ void test_ballistic_and_aimer(const AppConfig& cfg) {
               << " deg, t_fly=" << (sol.fly_time_s * 1000.0) << " ms)\n";
 }
 
+void test_mpc_planner_and_aimer(const AppConfig& cfg) {
+    std::cout << "[TEST] 纯 Eigen 轻量 TinyMPC 轨迹规划与切板平滑约束... ";
+
+#ifdef RM_AIM_WITH_EIGEN
+    MpcAxisConfig mpc_cfg{};
+    mpc_cfg.dt = 0.01;
+    mpc_cfg.horizon = 25;
+    mpc_cfg.max_vel = 6.0;
+    mpc_cfg.max_acc = 40.0;
+    mpc_cfg.q_pos = 200.0;
+    mpc_cfg.q_vel = 2.0;
+    mpc_cfg.r_acc = 0.01;
+
+    MpcAxisPlanner planner(mpc_cfg);
+
+    // 1) 闭环验证 20° (0.35 rad) 切板阶跃：满足速度/加速度硬约束、无明显超调且快速收敛
+    constexpr double kStepTarget = 0.35;
+    std::array<double, 26> ref_step{};
+    std::array<double, 26> ref_zero{};
+    ref_step.fill(kStepTarget);
+
+    double pos = 0.0;
+    double vel = 0.0;
+    double max_pos = 0.0;
+    for (int step = 0; step < 45; ++step) {
+        const MpcPlanOutput out =
+            planner.solve(pos, vel, ref_step.data(), ref_zero.data(), 26);
+        CHECK(std::fabs(out.vel) <= mpc_cfg.max_vel + 1e-6);
+        CHECK(std::fabs(out.acc) <= mpc_cfg.max_acc + 1e-6);
+        pos = out.pos;
+        vel = out.vel;
+        max_pos = std::max(max_pos, pos);
+    }
+    CHECK(std::fabs(pos - kStepTarget) < 0.005);
+    CHECK(std::fabs(vel) < 0.10);
+    CHECK(max_pos < kStepTarget + 0.03);
+
+    // 2) 验证前瞻平滑特性：未来第 10 步才切板时，当前步就会提前启动柔和加速
+    std::array<double, 26> ref_future_switch{};
+    for (int k = 0; k <= 25; ++k) {
+        ref_future_switch[static_cast<size_t>(k)] = (k >= 10) ? 0.30 : 0.0;
+    }
+    const MpcPlanOutput pre_out =
+        planner.solve(0.0, 0.0, ref_future_switch.data(), ref_zero.data(), 26);
+    CHECK(pre_out.acc > 0.1);
+    CHECK(pre_out.acc <= mpc_cfg.max_acc + 1e-6);
+
+    // 3) 联调 Aimer(planner="mpc")：验证输出满足硬约束且无 NaN
+    EkfTracker tracker(cfg.tracker, 0.20);
+    for (int i = 0; i < 15; ++i) {
+        WorldArmorObs obs{};
+        obs.pos_world = {3.0, -0.4 + i * 0.015, 0.15};
+        obs.yaw_world = kPi;
+        obs.class_id = 3;
+        tracker.update(static_cast<uint64_t>((i + 1) * 5'000'000ULL), {obs});
+    }
+    AimerConfig mpc_aimer_cfg = cfg.aimer;
+    mpc_aimer_cfg.planner = "mpc";
+    Aimer mpc_aimer(mpc_aimer_cfg);
+    CHECK(mpc_aimer.is_mpc_enabled());
+
+    ImuSample imu{};
+    imu.yaw = 0.0f;
+    imu.pitch = 0.0f;
+    imu.bullet_speed = 24.0f;
+    const GimbalCmd cmd = mpc_aimer.compute_command(tracker, imu);
+    CHECK(cmd.mode == 1 || cmd.mode == 2);
+    CHECK(std::isfinite(cmd.yaw) && std::isfinite(cmd.pitch));
+    CHECK(std::fabs(cmd.yaw_vel) <= mpc_aimer_cfg.mpc_max_yaw_vel + 1e-3);
+    CHECK(std::fabs(cmd.yaw_acc) <= mpc_aimer_cfg.mpc_max_yaw_acc + 1e-3);
+    CHECK(std::fabs(cmd.pitch_vel) <= mpc_aimer_cfg.mpc_max_pitch_vel + 1e-3);
+    CHECK(std::fabs(cmd.pitch_acc) <= mpc_aimer_cfg.mpc_max_pitch_acc + 1e-3);
+
+    // 4) 微秒级单帧耗时基准（500 次迭代平均）
+    constexpr int kBenchIters = 500;
+    const auto t0 = Clock::now();
+    volatile double sink = 0.0;
+    for (int i = 0; i < kBenchIters; ++i) {
+        const auto o = planner.solve(0.0, 0.0, ref_future_switch.data(), ref_zero.data(), 26);
+        sink += o.pos;
+    }
+    const double avg_us =
+        std::chrono::duration<double, std::micro>(Clock::now() - t0).count() / kBenchIters;
+    (void)sink;
+
+    std::cout << std::fixed << std::setprecision(1)
+              << "OK (solve=" << avg_us << " us, step_err=" << (std::fabs(pos - kStepTarget) * 180.0 / kPi)
+              << " deg, pre_acc=" << pre_out.acc << " rad/s^2)\n";
+#else
+    (void)cfg;
+    std::cout << "SKIPPED\n";
+#endif
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    const std::string cfg_path = (argc > 1) ? argv[1] : "config/default.yaml";
+    const std::string cfg_path = (argc > 1) ? argv[1] : "config/example.yaml";
     const AppConfig cfg = AppConfig::load(cfg_path);
 
     test_imu_buffer_slerp();
     test_pnp_1d_yaw_optimization(cfg);
     test_ekf_pulse_spin_and_extensible_predictor(cfg);
     test_ballistic_and_aimer(cfg);
+    test_mpc_planner_and_aimer(cfg);
 
-    std::cout << "All Phase 3 tests passed!\n";
+    std::cout << "All estimation tests passed!\n";
     return 0;
 }

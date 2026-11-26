@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 一键安装 Vernier systemd 开机自启与崩溃守护服务（面向无头实车 Orin NX / NUC）
+# 一键安装 Vernier systemd 开机自启与崩溃守护服务
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN_PATH="${1:-${REPO_DIR}/build/vernier}"
-CFG_PATH="${2:-${REPO_DIR}/config/default.yaml}"
+if [[ $# -lt 1 ]]; then
+    echo "用法: $0 <config.yaml> [bin_path]" >&2
+    echo "示例: $0 config/infantry_3.yaml" >&2
+    exit 1
+fi
+CFG_PATH="$(realpath "$1")"
+BIN_PATH="${2:-${REPO_DIR}/build/vernier}"
 RUN_USER="${SUDO_USER:-$USER}"
 SERVICE_FILE="/etc/systemd/system/vernier.service"
+
+if [[ ! -f "${CFG_PATH}" ]]; then
+    echo "错误：未找到配置文件 ${CFG_PATH}。" >&2
+    exit 1
+fi
 
 if [[ ! -x "${BIN_PATH}" ]]; then
     echo "错误：未找到可执行文件 ${BIN_PATH}，请先编译项目。" >&2

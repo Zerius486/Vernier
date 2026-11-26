@@ -19,6 +19,8 @@
 #include "rm_aim/core/config.hpp"
 #include "rm_aim/core/ring_buffer.hpp"
 #include "rm_aim/debug/mjpeg_server.hpp"
+#include "rm_aim/estimation/ballistic.hpp"
+#include "rm_aim/estimation/ekf_tracker.hpp"
 #include "rm_aim/estimation/imu_buffer.hpp"
 #include "rm_aim/hal/camera.hpp"
 #include "rm_aim/hal/serial.hpp"
@@ -42,12 +44,14 @@ void print_usage(const char* prog) {
               << "用法:\n"
               << "  1) 相机内参标定（棋盘格 + MJPEG 浏览器看图）:\n"
               << "     " << prog
-              << " intrinsic [config.yaml] [--cols 9] [--rows 6] [--square 0.025] [--port 8080]\n"
+              << " intrinsic <config.yaml> [--cols 9] [--rows 6] [--square 0.025] [--port 8080]\n"
               << "     终端按键: [Enter] 抓拍当前有效棋盘格帧 | [c] 开始解算 | [q] 退出\n\n"
               << "  2) 软同步时间差 + 外参旋转联合校准（静止装甲板 + 甩云台）:\n"
-              << "     " << prog << " sync [config.yaml] [--duration 6] [--port 8080]\n\n"
+              << "     " << prog << " sync <config.yaml> [--duration 6] [--port 8080]\n\n"
               << "  3) 从 .rmraw 录包导出 28x20 轻量 MLP 数字训练样本:\n"
-              << "     " << prog << " dump_digits [config.yaml] --input capture.rmraw --out dataset/raw [--stride 3]\n";
+              << "     " << prog << " dump_digits <config.yaml> --input capture.rmraw --out dataset/raw [--stride 3]\n\n"
+              << "  4) 离线复现 .rmraw（v1/v2 帧+IMU）全链路并对比 Direct/MPC 规划精度:\n"
+              << "     " << prog << " eval <config.yaml> --input capture.rmraw [--planner direct|mpc] [--csv out.csv]\n";
 }
 
 /// 非阻塞读取一行标准输入命令（用于 SSH 终端交互）
@@ -452,16 +456,9 @@ int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
         return 1;
     }
 
-    std::ifstream file(input_path, std::ios::binary);
-    if (!file.is_open()) {
-        std::cerr << "[Calib-Dump] 无法打开录包文件: " << input_path << "\n";
-        return 1;
-    }
-
-    rm_aim::hal::RawFileHeader hdr{};
-    file.read(reinterpret_cast<char*>(&hdr), sizeof(hdr));
-    if (!file.good() || std::memcmp(hdr.magic, "RMRAW001", 8) != 0) {
-        std::cerr << "[Calib-Dump] 无效的 .rmraw 文件头。\n";
+    rm_aim::hal::RawLogReader reader;
+    if (!reader.open(input_path)) {
+        std::cerr << "[Calib-Dump] 无法打开或识别 .rmraw 文件: " << input_path << "\n";
         return 1;
     }
 
@@ -476,20 +473,16 @@ int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
     auto detector = rm_aim::perception::create_armor_detector(det_cfg, cfg.enemy_color, *backend);
 
     std::vector<uint8_t> raw_buf;
+    rm_aim::hal::RawFrameHeader fhdr{};
+    rm_aim::ImuSample dummy_imu{};
+    rm_aim::hal::RawChunkType chunk_type = rm_aim::hal::RawChunkType::Frame;
     uint64_t frame_idx = 0;
     uint64_t saved_crops = 0;
     const int stride_step = std::max(1, frame_stride);
 
-    while (!g_stop.load(std::memory_order_acquire)) {
-        rm_aim::hal::RawFrameHeader fhdr{};
-        file.read(reinterpret_cast<char*>(&fhdr), sizeof(fhdr));
-        if (!file.good()) break;
-
-        raw_buf.resize(fhdr.byte_size);
-        file.read(reinterpret_cast<char*>(raw_buf.data()),
-                  static_cast<std::streamsize>(fhdr.byte_size));
-        if (!file.good()) break;
-
+    while (!g_stop.load(std::memory_order_acquire) &&
+           reader.read_next(chunk_type, fhdr, raw_buf, dummy_imu)) {
+        if (chunk_type != rm_aim::hal::RawChunkType::Frame) continue;
         if ((frame_idx++ % static_cast<uint64_t>(stride_step)) != 0) continue;
 
         rm_aim::FrameSlot slot{};
@@ -555,6 +548,165 @@ int run_dump_digits(const rm_aim::AppConfig& cfg, const std::string& input_path,
     return 0;
 }
 
+// ============================================================================
+// 子命令 4：离线复现 .rmraw（v1/v2 帧+IMU）全链路并统计检测/规划/切板指标
+// ============================================================================
+int run_eval(const rm_aim::AppConfig& cfg, const std::string& input_path,
+             const std::string& planner_override, const std::string& csv_path) {
+    if (input_path.empty()) {
+        std::cerr << "[Calib-Eval] 请通过 --input 指定 .rmraw 录包路径。\n";
+        return 1;
+    }
+
+    rm_aim::hal::RawLogReader reader;
+    if (!reader.open(input_path)) {
+        std::cerr << "[Calib-Eval] 无法打开或识别 .rmraw 文件: " << input_path << "\n";
+        return 1;
+    }
+
+    rm_aim::backend::MlpWeights weights;
+    if (std::filesystem::exists(cfg.detector.mlp_weights_path)) {
+        weights = rm_aim::backend::MlpWeights::load(cfg.detector.mlp_weights_path);
+    } else {
+        weights = rm_aim::backend::MlpWeights::make_dummy(3);
+    }
+
+    rm_aim::AimerConfig aimer_cfg = cfg.aimer;
+    if (!planner_override.empty()) {
+        aimer_cfg.planner = planner_override;
+    }
+
+    auto backend = rm_aim::backend::create_compute_backend(weights, true);
+    auto detector = rm_aim::perception::create_armor_detector(cfg.detector, cfg.enemy_color, *backend);
+    rm_aim::perception::PnpSolver pnp_solver(cfg.camera);
+    rm_aim::estimation::ImuBuffer imu_buffer;
+    rm_aim::estimation::EkfTracker tracker(cfg.tracker, 0.20);
+    rm_aim::estimation::Aimer aimer(aimer_cfg);
+
+    std::ofstream csv;
+    if (!csv_path.empty()) {
+        csv.open(csv_path, std::ios::trunc);
+        if (csv.is_open()) {
+            csv << "frame_id,ts_ns,det_us,armors,mode,yaw,yaw_vel,yaw_acc,"
+                   "pitch,pitch_vel,pitch_acc,switched,fire_hz\n";
+        }
+    }
+
+    std::vector<uint8_t> raw_buf;
+    rm_aim::hal::RawFrameHeader fhdr{};
+    rm_aim::ImuSample imu_chunk{};
+    rm_aim::hal::RawChunkType chunk_type = rm_aim::hal::RawChunkType::Frame;
+
+    uint64_t total_frames = 0;
+    uint64_t total_imu = 0;
+    uint64_t det_frames = 0;
+    uint64_t switch_count = 0;
+    double sum_det_us = 0.0;
+    double max_yaw_vel = 0.0;
+    double max_yaw_acc = 0.0;
+    double max_pitch_vel = 0.0;
+    double max_pitch_acc = 0.0;
+
+    while (!g_stop.load(std::memory_order_acquire) &&
+           reader.read_next(chunk_type, fhdr, raw_buf, imu_chunk)) {
+        if (chunk_type == rm_aim::hal::RawChunkType::Imu) {
+            imu_buffer.push(imu_chunk);
+            ++total_imu;
+            continue;
+        }
+
+        rm_aim::FrameSlot slot{};
+        slot.host_ptr = raw_buf.data();
+        slot.capacity = raw_buf.size();
+        slot.width = fhdr.width;
+        slot.height = fhdr.height;
+        slot.stride = fhdr.stride;
+        slot.byte_size = fhdr.byte_size;
+        slot.format = static_cast<rm_aim::PixelFormat>(fhdr.format);
+        slot.frame_id = fhdr.frame_id;
+        slot.timestamp_ns = fhdr.timestamp_ns;
+
+        rm_aim::perception::DetectTimingUs timing{};
+        auto armors = detector->detect(slot, &timing);
+        ++total_frames;
+        sum_det_us += timing.total_us;
+        if (!armors.empty()) ++det_frames;
+
+        rm_aim::ImuSample synced_imu{};
+        const bool has_imu = imu_buffer.query(slot.timestamp_ns, synced_imu);
+        if (!has_imu) {
+            synced_imu.timestamp_ns = slot.timestamp_ns;
+            synced_imu.mode = 1U;
+            synced_imu.q = {1.0f, 0.0f, 0.0f, 0.0f};
+            synced_imu.bullet_speed = 24.0f;
+        }
+
+        rm_aim::GimbalCmd cmd{};
+        if (has_imu && synced_imu.mode == 0U) {
+            tracker.reset();
+            detector->reset_roi();
+        } else {
+            Eigen::Matrix3d R_w2c;
+            Eigen::Vector3d t_w2c;
+            rm_aim::estimation::compute_world_to_cam_transform(synced_imu, cfg.extrinsics, R_w2c,
+                                                               t_w2c);
+            std::vector<rm_aim::estimation::WorldArmorObs> world_obs;
+            world_obs.reserve(armors.size());
+            for (auto& a : armors) {
+                if (pnp_solver.solve(a)) {
+                    auto obs =
+                        rm_aim::estimation::transform_armor_to_world(a, synced_imu, cfg.extrinsics);
+                    constexpr double kDeg15 = 15.0 * 3.14159265358979323846 / 180.0;
+                    const double armor_pitch = (a.class_id == 6) ? -kDeg15 : kDeg15;
+                    pnp_solver.refine_pose_4dof(a, obs.pos_world, obs.yaw_world, R_w2c, t_w2c,
+                                                armor_pitch);
+                    world_obs.push_back(obs);
+                }
+            }
+            tracker.update(slot.timestamp_ns, world_obs);
+            cmd = aimer.compute_command(tracker, synced_imu);
+        }
+
+        if (aimer.last_switched()) ++switch_count;
+        max_yaw_vel = std::max(max_yaw_vel, static_cast<double>(std::fabs(cmd.yaw_vel)));
+        max_yaw_acc = std::max(max_yaw_acc, static_cast<double>(std::fabs(cmd.yaw_acc)));
+        max_pitch_vel = std::max(max_pitch_vel, static_cast<double>(std::fabs(cmd.pitch_vel)));
+        max_pitch_acc = std::max(max_pitch_acc, static_cast<double>(std::fabs(cmd.pitch_acc)));
+
+        if (csv.is_open()) {
+            csv << slot.frame_id << "," << slot.timestamp_ns << "," << timing.total_us << ","
+                << armors.size() << "," << static_cast<unsigned>(cmd.mode) << "," << cmd.yaw << ","
+                << cmd.yaw_vel << "," << cmd.yaw_acc << "," << cmd.pitch << "," << cmd.pitch_vel
+                << "," << cmd.pitch_acc << "," << (aimer.last_switched() ? 1 : 0) << ","
+                << static_cast<unsigned>(cmd.fire_rate_hz) << "\n";
+        }
+    }
+
+    const double det_rate = (total_frames > 0) ? (100.0 * static_cast<double>(det_frames) /
+                                                  static_cast<double>(total_frames))
+                                               : 0.0;
+    const double avg_det_us =
+        (total_frames > 0) ? (sum_det_us / static_cast<double>(total_frames)) : 0.0;
+
+    std::cout << std::fixed << std::setprecision(2)
+              << "\n========== Vernier 离线复现评测报告 ==========\n"
+              << "录包版本       : RMRAW v" << reader.version() << " (" << input_path << ")\n"
+              << "后端 / 规划器  : " << backend->name() << " / " << aimer_cfg.planner << "\n"
+              << "总帧数 / IMU数 : " << total_frames << " 帧 / " << total_imu << " 条\n"
+              << "检出率         : " << det_rate << "% (" << det_frames << "/" << total_frames
+              << ")\n"
+              << "平均检测耗时   : " << avg_det_us << " us\n"
+              << "切板次数       : " << switch_count << "\n"
+              << "峰值前馈 Yaw   : |vel|=" << max_yaw_vel << " rad/s, |acc|=" << max_yaw_acc
+              << " rad/s^2\n"
+              << "峰值前馈 Pitch : |vel|=" << max_pitch_vel << " rad/s, |acc|=" << max_pitch_acc
+              << " rad/s^2\n";
+    if (!csv_path.empty()) {
+        std::cout << "逐帧轨迹 CSV   : " << csv_path << "\n";
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -567,7 +719,7 @@ int main(int argc, char** argv) {
     }
 
     const std::string mode = argv[1];
-    std::string cfg_path = "config/default.yaml";
+    std::string cfg_path;
     int cols = 9;
     int rows = 6;
     float square = 0.025f;
@@ -575,6 +727,8 @@ int main(int argc, char** argv) {
     uint16_t port = 8080;
     std::string input_path;
     std::string out_dir = "dataset/raw";
+    std::string planner_override;
+    std::string csv_path;
     int stride = 3;
 
     for (int i = 2; i < argc; ++i) {
@@ -593,11 +747,21 @@ int main(int argc, char** argv) {
             input_path = argv[++i];
         } else if (a == "--out" && i + 1 < argc) {
             out_dir = argv[++i];
+        } else if (a == "--planner" && i + 1 < argc) {
+            planner_override = argv[++i];
+        } else if (a == "--csv" && i + 1 < argc) {
+            csv_path = argv[++i];
         } else if (a == "--stride" && i + 1 < argc) {
             stride = std::stoi(argv[++i]);
         } else if (!a.empty() && a[0] != '-') {
             cfg_path = a;
         }
+    }
+
+    if (cfg_path.empty()) {
+        std::cerr << "[Vernier-Calib] 错误：请显式指定配置文件路径。\n";
+        print_usage(argv[0]);
+        return 1;
     }
 
     rm_aim::AppConfig cfg;
@@ -616,6 +780,9 @@ int main(int argc, char** argv) {
     }
     if (mode == "dump_digits") {
         return run_dump_digits(cfg, input_path, out_dir, stride);
+    }
+    if (mode == "eval") {
+        return run_eval(cfg, input_path, planner_override, csv_path);
     }
 
     std::cerr << "[Vernier-Calib] 未知子命令: " << mode << "\n";

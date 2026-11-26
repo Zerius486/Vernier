@@ -3,6 +3,7 @@
 #include "rm_aim/core/config.hpp"
 #include "rm_aim/core/types.hpp"
 #include "rm_aim/estimation/ekf_tracker.hpp"
+#include "rm_aim/estimation/mpc_planner.hpp"
 
 namespace rm_aim::estimation {
 
@@ -41,10 +42,11 @@ public:
 
     int selected_armor_id() const noexcept { return last_armor_id_; }
     bool last_switched() const noexcept { return last_switched_; }
+    bool is_mpc_enabled() const noexcept { return use_mpc_; }
     double filtered_bullet_speed() const noexcept { return filtered_bullet_speed_; }
 
 private:
-    int select_armor_id(const VehicleState& state, double center_yaw) const;
+    int select_armor_id(const VehicleState& state, double center_yaw, int prev_id) const;
     BallisticSolution solve_for_armor_at(const EkfTracker& tracker, int armor_id,
                                          double dt, double bullet_speed) const;
     uint8_t compute_adaptive_fire_rate(double dist_m, double yaw_err_rad, double v_yaw) const noexcept;
@@ -52,6 +54,9 @@ private:
 
     AimerConfig cfg_;
     BallisticSolver ballistic_;
+    bool use_mpc_ = false;
+    MpcAxisPlanner yaw_mpc_;
+    MpcAxisPlanner pitch_mpc_;
     int last_armor_id_ = -1;
     bool last_switched_ = false;
     double filtered_bullet_speed_ = 24.0;
